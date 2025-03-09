@@ -1,0 +1,24 @@
+[package]
+name = "grrs"
+version = "0.1.0"
+authors = ["The Lazy <francis.igbiriki@gmail.com>"]
+license = "MIT OR Apache-2.0"
+description = "a tool to manage your env variables"
+readme = "README.md"
+homepage = "https://clienv.dev"
+repository = "https://github.com/igmrrf/clienv"
+keywords = ["cli", "env", "manage", "track", "share", "encrypt"]
+categories = ["command-line-utiliies"]
+edition = "2024"
+
+[dependencies]
+clap-verbosity-flag = "3.0.2"
+log = "0.4.26"
+anyhow = "1.0.97"
+indicatif = "0.17.11"
+clap = { version = "4.5.31", features = ["derive"] }
+
+[dev-dependencies]
+assert_cmd = "2.0.16"
+assert_fs = "1.1.2"
+predicates = "3.1.3"
