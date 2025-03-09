@@ -8,7 +8,7 @@ readme = "README.md"
 homepage = "https://clienv.dev"
 repository = "https://github.com/igmrrf/clienv"
 keywords = ["cli", "env", "manage", "track", "encrypt"]
-categories = ["command-line-utiliies"]
+categories = ["command-line-utilities", "virtualization"]
 edition = "2024"
 
 [dependencies]
