@@ -1,7 +1,7 @@
 use clap::Parser;
 use anyhow::{Context, Result};
 use std::io::{self, Write};
-use "./lib.rs"::{find_matches};
+mod lib;
 
 // / Search for a pattern in a file and display the lines that contain it
 #[derive(Parser)]
@@ -18,12 +18,11 @@ fn main() -> Result<()> {
 
     let content = std::fs::read_to_string(&args.path)
         .with_context(|| format!("could  not read file `{}`", args.path.display()))?;
-    find_matches(content, &args.pattern, &mut std::io::stdout());
+    lib::find_matches(&content, &args.pattern, &mut std::io::stdout());
     Ok(())
 }
 
 
-//
 // fn progress(){
 //     let pb = indicatif::ProgressBar::new(100);
 //     for i in 0..100{

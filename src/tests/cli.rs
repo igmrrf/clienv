@@ -2,12 +2,13 @@ use assert_cmd::prelude::*; // add methods on commands
 use predicates::prelude::*; // used for writing assertions
 use std::process::Command; // run programs
 use assert_fs::prelude::*; // create temp file
+mod lib;
 
 
 // TODO: look into proptest and fuzzer crates
 #[test]
 fn check_answer_validity(){
-    assert_eq!(answer(), 42);
+    assert_eq!(lib::answer(), 42);
 }
 
 #[test]
@@ -50,6 +51,6 @@ fn find_content_in_file() -> Result<(), Box<dyn std::error:Error>> {
 #[test]
 fn find_a_match(){
     let mut result = Vec::new();
-    find_matches("lorem ipsum\ndolor sit here", "lorem", &mut result)
+    lib::find_matches("lorem ipsum\ndolor sit here", "lorem", &mut result)
     assert_eq!(result,b"lorem ipsum\n");
 }
