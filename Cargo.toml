@@ -1,5 +1,5 @@
 [package]
-name = "grrs"
+name = "clienv"
 version = "0.1.0"
 authors = ["The Lazy <francis.igbiriki@gmail.com>"]
 license = "MIT OR Apache-2.0"
