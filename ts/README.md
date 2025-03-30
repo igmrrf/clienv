@@ -325,8 +325,10 @@ Commands:
   # Environment Management
   convert      Convert between environment file formats
   validate     Validate environment files against schema
-  generate     Generate schema from environment files
-  template     Generate environment templates
+  generate     Generate schemas/template from environment files
+    --templage Generate templae from environment files
+    --schema   Generate validation schema from environment files
+    --sample
   encrypt      Encrypt environment files
   decrypt      Decrypt environment files
   log          Display environment variables
