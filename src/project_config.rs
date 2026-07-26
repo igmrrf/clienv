@@ -11,7 +11,7 @@ pub struct ProjectConfig {
 }
 
 pub fn get_project_config_path() -> PathBuf {
-    PathBuf::from(".clienv.json")
+    PathBuf::from(".bsec.json")
 }
 
 pub fn load_project_config() -> Option<ProjectConfig> {
@@ -26,6 +26,7 @@ pub fn load_project_config() -> Option<ProjectConfig> {
     None
 }
 
+#[allow(dead_code)]
 pub fn save_project_config(config: &ProjectConfig) -> anyhow::Result<()> {
     let path = get_project_config_path();
     let content = serde_json::to_string_pretty(config)?;

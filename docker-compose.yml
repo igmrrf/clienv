@@ -1,10 +1,10 @@
-name: clienv-testnet
+name: bsec-testnet
 
 services:
   # Local EVM Testnet Node (Anvil - Foundry)
   anvil:
     image: ghcr.io/foundry-rs/foundry:latest
-    container_name: clienv-local-testnet
+    container_name: bsec-local-testnet
     restart: unless-stopped
     command: >
       anvil
@@ -34,7 +34,7 @@ services:
   # Local IPFS Gateway & Pinning node for decentralized secret storage testing
   ipfs:
     image: ipfs/kubo:latest
-    container_name: clienv-local-ipfs
+    container_name: bsec-local-ipfs
     restart: unless-stopped
     ports:
       - "4001:4001"

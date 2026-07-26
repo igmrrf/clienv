@@ -16,5 +16,5 @@ impl Default for Config {
 }
 
 pub fn get_config() -> Config {
-    confy::load("clienv", "clienv").unwrap_or_default()
+    confy::load("bsec", "bsec").unwrap_or_default()
 }

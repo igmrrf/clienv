@@ -1,4 +1,4 @@
-# CLIENV
+# BSEC
 
 A powerful, high-performance CLI tool written in Rust for secure, decentralized environment variable management, file encryption, format conversion, schema validation, process environment injection, and secret sharing.
 
@@ -24,7 +24,7 @@ A powerful, high-performance CLI tool written in Rust for secure, decentralized 
 cargo build --release
 
 # Run binary
-./target/release/clienv --help
+./target/release/bsec --help
 ```
 
 ---
@@ -35,80 +35,80 @@ cargo build --release
 
 ```bash
 # Initialize a new wallet
-clienv init
+bsec init
 
 # Initialize with password protection
-clienv init --password "your_password"
+bsec init --password "your_password"
 
 # Import an existing wallet from mnemonic
-clienv init --import-mnemonic "word1 word2 ... word12"
+bsec init --import-mnemonic "word1 word2 ... word12"
 
 # View wallet details
-clienv wallet info
+bsec wallet info
 ```
 
-### 2. Process Environment Injection (`clienv run`)
+### 2. Process Environment Injection (`bsec run`)
 
 ```bash
 # Run command with environment variables injected from .env.local (default)
-clienv run -- npm run dev
+bsec run -- npm run dev
 
 # Run command with injected environment variables from a custom or encrypted file
-clienv run -e .env.prod.enc -- python app.py
+bsec run -e .env.prod.enc -- python app.py
 ```
 
 ### 3. Secret Sharing & Ephemeral Storage
 
 ```bash
 # Share secret text (expires in 24h by default, 1 max read)
-clienv share --content "my-secret-api-key"
+bsec share --content "my-secret-api-key"
 
 # Share secret with custom TTL and max reads limit
-clienv share --content "database-password" --ttl 1h --max-reads 5 --to 0x123...
+bsec share --content "database-password" --ttl 1h --max-reads 5 --to 0x123...
 
 # Share secret from file
-clienv share --file secret.txt --ttl 7d
+bsec share --file secret.txt --ttl 7d
 
 # View a secret (auto-destructs upon reaching max reads or expiry)
-clienv view <secret_id>
+bsec view <secret_id>
 
 # Save decrypted secret directly to a file
-clienv view <secret_id> --output decrypted.txt
+bsec view <secret_id> --output decrypted.txt
 
 # List active or expired secrets
-clienv list --active
-clienv list --expired
+bsec list --active
+bsec list --expired
 
 # Revoke a shared secret immediately
-clienv revoke <secret_id>
+bsec revoke <secret_id>
 
 # Hide secret(s)
-clienv hide <secret_id>
+bsec hide <secret_id>
 ```
 
 ### 4. Network Configuration
 
 ```bash
 # Display current network configuration
-clienv config --show
+bsec config --show
 
 # Configure network (polygon, base, amoy, sepolia, base-sepolia, local)
-clienv config --network amoy
+bsec config --network amoy
 
 # Set custom network and RPC endpoint
-clienv config --network sepolia --rpc "https://rpc.sepolia.org"
+bsec config --network sepolia --rpc "https://rpc.sepolia.org"
 ```
 
 ### 5. Testnets & Free Faucets Guide
 
-For team development, testing, or zero-cost execution, configure `clienv` to use a testnet or local node:
+For team development, testing, or zero-cost execution, configure `bsec` to use a testnet or local node:
 
-| Network | Chain ID | `clienv` Network Flag | Free Token Faucet Links |
+| Network | Chain ID | `bsec` Network Flag | Free Token Faucet Links |
 | :--- | :---: | :--- | :--- |
-| **Polygon Amoy Testnet** | `80002` | `clienv config --network amoy` | • <https://faucet.polygon.technology/> |
-| **Ethereum Sepolia Testnet** | `11155111` | `clienv config --network sepolia` | • <https://sepoliafaucet.com/><br>• <https://sepolia-faucet.pk910.de/><br>• <https://faucets.chain.link/> |
-| **Base Sepolia Testnet** | `84532` | `clienv config --network base-sepolia` | • <https://www.bwarelabs.com/faucets/base-sepolia><br>• <https://faucets.chain.link/base-sepolia> |
-| **Local Docker Compose Node** | `31337` | `clienv config --network local` | • **Auto Pre-Funded** (10,000 test ETH on `docker compose up`) |
+| **Polygon Amoy Testnet** | `80002` | `bsec config --network amoy` | • <https://faucet.polygon.technology/> |
+| **Ethereum Sepolia Testnet** | `11155111` | `bsec config --network sepolia` | • <https://sepoliafaucet.com/><br>• <https://sepolia-faucet.pk910.de/><br>• <https://faucets.chain.link/> |
+| **Base Sepolia Testnet** | `84532` | `bsec config --network base-sepolia` | • <https://www.bwarelabs.com/faucets/base-sepolia><br>• <https://faucets.chain.link/base-sepolia> |
+| **Local Docker Compose Node** | `31337` | `bsec config --network local` | • **Auto Pre-Funded** (10,000 test ETH on `docker compose up`) |
 
 #### Using Local Docker Testnet
 
@@ -116,34 +116,34 @@ For team development, testing, or zero-cost execution, configure `clienv` to use
 # Spin up local EVM node (Anvil) & IPFS gateway in Docker
 docker compose up -d
 
-# Switch clienv to local testnet
-clienv config --network local
+# Switch bsec to local testnet
+bsec config --network local
 ```
 
 ### 6. Format Conversion & Utilities
 
 ```bash
 # Convert JSON to .env format
-clienv convert config.json .env.local --format env
+bsec convert config.json .env.local --format env
 
 # Convert with prefix
-clienv convert config.json .env.local --prefix "NEXT_PUBLIC_"
+bsec convert config.json .env.local --prefix "NEXT_PUBLIC_"
 
 # Embed JavaScript object properties
-clienv convert config.json config.js --embed "VUE_APP_"
+bsec convert config.json config.js --embed "VUE_APP_"
 ```
 
 ### 7. Schema Validation & Templates
 
 ```bash
 # Validate .env.local against .env.schema
-clienv validate -e .env.local -s .env.schema
+bsec validate -e .env.local -s .env.schema
 
 # Generate .env.template from existing .env file
-clienv generate -e .env -o .env.template
+bsec generate -e .env -o .env.template
 
 # Inspect single environment variable value
-clienv log MONGO_URL -f .env.local
+bsec log MONGO_URL -f .env.local
 ```
 
 ### 8. File-Level Encryption
@@ -153,23 +153,23 @@ clienv log MONGO_URL -f .env.local
 echo "my_secure_password" > .env.pass
 
 # Encrypt .env file
-clienv encrypt .env -o .env.enc
+bsec encrypt .env -o .env.enc
 
 # Decrypt .env.enc file
-clienv decrypt .env.enc -o .env.dec
+bsec decrypt .env.enc -o .env.dec
 ```
 
 ### 9. Legacy Key-Value Storage
 
 ```bash
 # Store encrypted key-value pair
-clienv set MONGO_URI "mongodb://localhost:27017"
+bsec set MONGO_URI "mongodb://localhost:27017"
 
 # Retrieve key-value pair
-clienv get MONGO_URI
+bsec get MONGO_URI
 
 # Search for pattern in file
-clienv search "API_KEY" --path .env
+bsec search "API_KEY" --path .env
 ```
 
 ---

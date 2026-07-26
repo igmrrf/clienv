@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod bip39_words;
 mod config;
 mod env_file;
 mod helpers;
@@ -10,12 +11,17 @@ mod project_config;
 mod secrets;
 mod wallet;
 
+#[cfg(test)]
+mod config_test;
+#[cfg(test)]
+mod manager_test;
+
 #[derive(Parser, Debug)]
 #[command(
-    name = "clienv",
+    name = "bsec",
     version,
     about = "Decentralized, secure secret management and environment variable CLI tool",
-    long_about = "clienv is a CLI tool for secure environment variable management, schema validation, format conversion, and ephemeral secret sharing."
+    long_about = "bsec is a CLI tool for secure environment variable management, schema validation, format conversion, and ephemeral secret sharing."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -292,7 +298,7 @@ enum WalletCommands {
 fn print_banner() {
     println!("╔═══════════════════════════════════════╗");
     println!("║                                       ║");
-    println!("║               CLIENV                  ║");
+    println!("║                 BSEC                  ║");
     println!("║  Blockchain-based Secret Management   ║");
     println!("║                                       ║");
     println!("╚═══════════════════════════════════════╝");
@@ -390,10 +396,13 @@ fn main() {
                 return;
             };
 
-            let recipient = to.unwrap_or_else(|| "0x0000000000000000000000000000000000000000".to_string());
+            let recipient = to.unwrap_or_else(|| "public".to_string());
             let sender = match wallet::get_wallet_info(None) {
                 Ok(w) => w.address,
-                Err(_) => "0x0000000000000000000000000000000000000000".to_string(),
+                Err(e) => {
+                    eprintln!("Error getting wallet info: {e}");
+                    return;
+                }
             };
 
             match secrets::share_secret(&secret_content, &ttl, max_reads, &recipient, &sender) {
@@ -402,7 +411,7 @@ fn main() {
                     println!("Secret ID: {}", rec.id);
                     println!("Expires At: {}", rec.expires_at);
                     println!("Max Reads: {}", rec.max_reads);
-                    println!("To view this secret, run: clienv view {}", rec.id);
+                    println!("To view this secret, run: bsec view {}", rec.id);
                 }
                 Err(e) => eprintln!("Error sharing secret: {}", e),
             }
@@ -415,7 +424,10 @@ fn main() {
         }) => {
             let user_addr = match wallet::get_wallet_info(password.as_deref()) {
                 Ok(w) => w.address,
-                Err(_) => "0x0000000000000000000000000000000000000000".to_string(),
+                Err(e) => {
+                    eprintln!("Error loading wallet: {e}");
+                    return;
+                }
             };
 
             match secrets::view_secret(&secret_id, &user_addr) {
@@ -446,7 +458,10 @@ fn main() {
         }) => {
             let user_addr = match wallet::get_wallet_info(None) {
                 Ok(w) => w.address,
-                Err(_) => "0x0000000000000000000000000000000000000000".to_string(),
+                Err(e) => {
+                    eprintln!("Error loading wallet: {e}");
+                    return;
+                }
             };
 
             match secrets::list_secrets(&user_addr, user.as_deref(), all, expired, active) {
@@ -474,7 +489,10 @@ fn main() {
         Some(Commands::Revoke { secret_id }) => {
             let user_addr = match wallet::get_wallet_info(None) {
                 Ok(w) => w.address,
-                Err(_) => "0x0000000000000000000000000000000000000000".to_string(),
+                Err(e) => {
+                    eprintln!("Error loading wallet: {e}");
+                    return;
+                }
             };
 
             match secrets::revoke_secret(&secret_id, &user_addr) {
@@ -490,7 +508,10 @@ fn main() {
         }) => {
             let user_addr = match wallet::get_wallet_info(None) {
                 Ok(w) => w.address,
-                Err(_) => "0x0000000000000000000000000000000000000000".to_string(),
+                Err(e) => {
+                    eprintln!("Error loading wallet: {e}");
+                    return;
+                }
             };
 
             match secrets::hide_secret(secret_id.as_deref(), user.as_deref(), &user_addr) {

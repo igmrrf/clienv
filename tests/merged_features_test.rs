@@ -5,7 +5,7 @@ use std::process::Command;
 
 #[test]
 fn test_cli_help() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = Command::cargo_bin("clienv")?;
+    let mut cmd = Command::cargo_bin("bsec")?;
     cmd.arg("--help");
     cmd.assert()
         .success()
@@ -20,7 +20,7 @@ fn test_convert_json_to_env() -> Result<(), Box<dyn std::error::Error>> {
     input_json.write_str(r#"{"PORT": "8080", "DB_HOST": "localhost"}"#)?;
     let output_env = temp_dir.child(".env.out");
 
-    let mut cmd = Command::cargo_bin("clienv")?;
+    let mut cmd = Command::cargo_bin("bsec")?;
     cmd.arg("convert")
         .arg("--file")
         .arg(input_json.path())
@@ -44,7 +44,7 @@ fn test_validate_and_generate() -> Result<(), Box<dyn std::error::Error>> {
     env_file.write_str("API_KEY=secret_123\nDATABASE_URL=postgres://localhost\n")?;
     let template_file = temp_dir.child(".env.template");
 
-    let mut cmd = Command::cargo_bin("clienv")?;
+    let mut cmd = Command::cargo_bin("bsec")?;
     cmd.arg("generate")
         .arg("--env")
         .arg(env_file.path())
@@ -72,7 +72,7 @@ fn test_file_encrypt_decrypt() -> Result<(), Box<dyn std::error::Error>> {
     let dec_file = temp_dir.child(".env.test.dec");
 
     // Encrypt
-    let mut cmd = Command::cargo_bin("clienv")?;
+    let mut cmd = Command::cargo_bin("bsec")?;
     cmd.env("DOTENV_PASS", "testpassword123");
     cmd.arg("encrypt")
         .arg(env_file.path())
@@ -83,7 +83,7 @@ fn test_file_encrypt_decrypt() -> Result<(), Box<dyn std::error::Error>> {
     assert!(enc_file.path().exists());
 
     // Decrypt
-    let mut cmd_dec = Command::cargo_bin("clienv")?;
+    let mut cmd_dec = Command::cargo_bin("bsec")?;
     cmd_dec.env("DOTENV_PASS", "testpassword123");
     cmd_dec.arg("decrypt")
         .arg(enc_file.path())
@@ -101,9 +101,9 @@ fn test_file_encrypt_decrypt() -> Result<(), Box<dyn std::error::Error>> {
 fn test_run_command_process_injection() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = assert_fs::TempDir::new()?;
     let env_file = temp_dir.child(".env.run");
-    env_file.write_str("INJECTED_TEST_VAR=hello_from_clienv\n")?;
+    env_file.write_str("INJECTED_TEST_VAR=hello_from_bsec\n")?;
 
-    let mut cmd = Command::cargo_bin("clienv")?;
+    let mut cmd = Command::cargo_bin("bsec")?;
     cmd.arg("run")
         .arg("-e")
         .arg(env_file.path())
@@ -114,7 +114,7 @@ fn test_run_command_process_injection() -> Result<(), Box<dyn std::error::Error>
 
     cmd.assert()
         .success()
-        .stdout(predicate::str::contains("hello_from_clienv"));
+        .stdout(predicate::str::contains("hello_from_bsec"));
 
     Ok(())
 }
@@ -122,13 +122,13 @@ fn test_run_command_process_injection() -> Result<(), Box<dyn std::error::Error>
 #[test]
 fn test_run_with_project_config() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = assert_fs::TempDir::new()?;
-    let proj_config = temp_dir.child(".clienv.json");
+    let proj_config = temp_dir.child(".bsec.json");
     proj_config.write_str(r#"{"env_file": ".env.proj"}"#)?;
 
     let env_file = temp_dir.child(".env.proj");
     env_file.write_str("PROJECT_ENV_KEY=project_value_123\n")?;
 
-    let mut cmd = Command::cargo_bin("clienv")?;
+    let mut cmd = Command::cargo_bin("bsec")?;
     cmd.current_dir(temp_dir.path());
     cmd.arg("run")
         .arg("--")
@@ -139,6 +139,18 @@ fn test_run_with_project_config() -> Result<(), Box<dyn std::error::Error>> {
     cmd.assert()
         .success()
         .stdout(predicate::str::contains("project_value_123"));
+
+    Ok(())
+}
+
+#[test]
+fn test_wallet_init_mnemonic() -> Result<(), Box<dyn std::error::Error>> {
+    let mut cmd = Command::cargo_bin("bsec")?;
+    cmd.arg("init").arg("--overwrite");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("Wallet initialized successfully!"));
 
     Ok(())
 }

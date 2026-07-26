@@ -1,12 +1,12 @@
 [package]
-name = "clienv"
+name = "bsec"
 version = "0.1.0"
 authors = ["The Lazy <francis.igbiriki@gmail.com>"]
 license = "MIT OR Apache-2.0"
 description = "a tool to manage your env variables"
 readme = "README.md"
-homepage = "https://clienv.dev"
-repository = "https://github.com/igmrrf/clienv"
+homepage = "https://bsec.dev"
+repository = "https://github.com/igmrrf/bsec"
 keywords = ["cli", "env", "manage", "track", "encrypt"]
 categories = ["command-line-utilities", "virtualization"]
 edition = "2024"
@@ -24,6 +24,7 @@ dotenv = "0.15.0"
 confy = "0.6.1"
 indicatif = "0.17.11"
 lazy_static = "1.5.0"
+sha2 = "0.10.8"
 tempfile = "3.19.0"
 
 [dev-dependencies]

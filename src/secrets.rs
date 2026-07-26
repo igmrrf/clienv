@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
+use crate::wallet::{bytes_to_hex, hash_digest, set_private_file_permissions};
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SecretRecord {
     pub id: String,
@@ -52,21 +54,6 @@ pub fn get_secrets_dir() -> PathBuf {
         let _ = fs::create_dir_all(&dir);
     }
     dir
-}
-
-fn hash_digest(input: &[u8]) -> [u8; 32] {
-    let mut h: [u8; 32] = [
-        0x6a, 0x09, 0xe6, 0x67, 0xbb, 0x67, 0xae, 0x85, 0x3c, 0x6e, 0xf3, 0x72, 0xa5, 0x4f, 0x53, 0x79,
-        0x51, 0x0e, 0x52, 0x7f, 0x9b, 0x05, 0x68, 0x8c, 0x1f, 0x83, 0xd9, 0xab, 0x5b, 0xe0, 0xcd, 0x19,
-    ];
-    for (i, &b) in input.iter().enumerate() {
-        h[i % 32] = h[i % 32].wrapping_add(b).wrapping_mul(33u8).rotate_left(3);
-    }
-    h
-}
-
-fn bytes_to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 fn encrypt_text(plain: &str, key_bytes: &[u8; 32]) -> String {
@@ -137,6 +124,7 @@ pub fn share_secret(
 
     let path = get_secrets_dir().join(format!("{}.json", secret_id));
     fs::write(&path, serde_json::to_string_pretty(&record)?)?;
+    set_private_file_permissions(&path);
 
     Ok(record)
 }
@@ -165,20 +153,26 @@ pub fn view_secret(secret_id: &str, user_address: &str) -> Result<String> {
         return Err(anyhow!("Maximum read count exceeded for this secret."));
     }
 
-    record.read_count += 1;
-
+    // Decrypt BEFORE mutating state
     let key_bytes_vec = BASE64_STANDARD
         .decode(&record.content_key)
         .map_err(|_| anyhow!("Failed to decode content key"))?;
     let mut key_bytes = [0u8; 32];
+    if key_bytes_vec.len() != 32 {
+        return Err(anyhow!("Invalid content key length"));
+    }
     key_bytes.copy_from_slice(&key_bytes_vec);
 
     let decrypted = decrypt_text(&record.content, &key_bytes)?;
+
+    // Increment read count only after successful decryption
+    record.read_count += 1;
 
     if record.read_count >= record.max_reads {
         let _ = fs::remove_file(&path);
     } else {
         let _ = fs::write(&path, serde_json::to_string_pretty(&record)?);
+        set_private_file_permissions(&path);
     }
 
     Ok(decrypted)
@@ -285,6 +279,7 @@ pub fn hide_secret(secret_id: Option<&str>, user_filter: Option<&str>, user_addr
                     if should_hide {
                         record.hidden = true;
                         let _ = fs::write(entry.path(), serde_json::to_string_pretty(&record)?);
+                        set_private_file_permissions(&entry.path());
                         hidden_count += 1;
                     }
                 }

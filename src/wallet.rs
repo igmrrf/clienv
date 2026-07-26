@@ -4,8 +4,9 @@ use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Nonce};
 use base64::prelude::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -35,7 +36,7 @@ pub struct WalletFile {
 
 pub fn get_app_dir() -> PathBuf {
     let mut dir = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    dir.push(".clienv");
+    dir.push(".bsec");
     if !dir.exists() {
         let _ = fs::create_dir_all(&dir);
     }
@@ -56,23 +57,41 @@ pub fn current_timestamp() -> u64 {
         .as_secs()
 }
 
-fn hash_digest(input: &[u8]) -> [u8; 32] {
-    let mut h: [u8; 32] = [
-        0x6a, 0x09, 0xe6, 0x67, 0xbb, 0x67, 0xae, 0x85, 0x3c, 0x6e, 0xf3, 0x72, 0xa5, 0x4f, 0x53, 0x79,
-        0x51, 0x0e, 0x52, 0x7f, 0x9b, 0x05, 0x68, 0x8c, 0x1f, 0x83, 0xd9, 0xab, 0x5b, 0xe0, 0xcd, 0x19,
-    ];
-    for (i, &b) in input.iter().enumerate() {
-        h[i % 32] = h[i % 32].wrapping_add(b).wrapping_mul(33u8).rotate_left(3);
+pub fn set_private_file_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
     }
-    h
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
-fn bytes_to_hex(bytes: &[u8]) -> String {
+pub fn hash_digest(input: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(input);
+    hasher.finalize().into()
+}
+
+pub fn bytes_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-fn derive_key(password: &str) -> [u8; 32] {
-    hash_digest(password.as_bytes())
+pub fn derive_key(password: &str) -> [u8; 32] {
+    let salt = b"bsec_crypto_salt_v1";
+    let mut hasher = Sha256::new();
+    hasher.update(salt);
+    hasher.update(password.as_bytes());
+    let mut key: [u8; 32] = hasher.finalize().into();
+    for _ in 0..10_000 {
+        let mut h = Sha256::new();
+        h.update(&key);
+        h.update(password.as_bytes());
+        key = h.finalize().into();
+    }
+    key
 }
 
 pub fn encrypt_wallet(data_str: &str, password: &str) -> String {
@@ -111,18 +130,22 @@ pub fn decrypt_wallet(encrypted_str: &str, password: &str) -> Result<String> {
 }
 
 pub fn generate_mnemonic() -> String {
-    let word_list = [
-        "abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract",
-        "absurd", "abuse", "access", "accident", "account", "accuse", "achieve", "acid",
-        "acoustic", "acquire", "across", "act", "action", "actor", "actress", "actual",
-    ];
-    let mut rand_bytes = [0u8; 12];
+    let mut rand_bytes = [0u8; 16]; // 128 bits of entropy
     OsRng.fill_bytes(&mut rand_bytes);
 
-    let mut words = Vec::new();
-    for &b in &rand_bytes {
-        let idx = (b as usize) % word_list.len();
-        words.push(word_list[idx]);
+    let mut words = Vec::with_capacity(12);
+    for chunk in rand_bytes.chunks(2) {
+        let val = ((chunk[0] as usize) << 8) | (chunk[1] as usize);
+        let idx = val % crate::bip39_words::BIP39_WORDS.len();
+        words.push(crate::bip39_words::BIP39_WORDS[idx]);
+    }
+    // Ensure exactly 12 words for mnemonic
+    while words.len() < 12 {
+        let mut b = [0u8; 2];
+        OsRng.fill_bytes(&mut b);
+        let val = ((b[0] as usize) << 8) | (b[1] as usize);
+        let idx = val % crate::bip39_words::BIP39_WORDS.len();
+        words.push(crate::bip39_words::BIP39_WORDS[idx]);
     }
     words.join(" ")
 }
@@ -178,6 +201,7 @@ pub fn init_wallet(
     };
 
     fs::write(&wallet_path, serde_json::to_string_pretty(&wallet_file)?)?;
+    set_private_file_permissions(&wallet_path);
 
     let config = WalletConfig {
         address: address.clone(),
@@ -185,6 +209,7 @@ pub fn init_wallet(
         user_id,
     };
     fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
+    set_private_file_permissions(&config_path);
 
     Ok(wallet_info)
 }
@@ -194,7 +219,7 @@ pub fn get_wallet_info(password: Option<&str>) -> Result<WalletInfo> {
     let wallet_path = app_dir.join("wallet.json");
 
     if !wallet_path.exists() {
-        return Err(anyhow!("No wallet found. Please run 'clienv init' first."));
+        return Err(anyhow!("No wallet found. Please run 'bsec init' first."));
     }
 
     let content = fs::read_to_string(&wallet_path)?;

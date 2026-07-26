@@ -14,6 +14,7 @@ fn find_matches(content: &str, pattern: &str, mut writer: impl std::io::Write) {
     }
 }
 
+#[allow(dead_code)]
 pub fn log() -> Result<(), Box<dyn Error>> {
     info!("Starting up");
     warn!("oops, nothing implemented!");

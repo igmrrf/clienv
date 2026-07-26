@@ -8,16 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-fn hash_digest(input: &[u8]) -> [u8; 32] {
-    let mut h: [u8; 32] = [
-        0x6a, 0x09, 0xe6, 0x67, 0xbb, 0x67, 0xae, 0x85, 0x3c, 0x6e, 0xf3, 0x72, 0xa5, 0x4f, 0x53, 0x79,
-        0x51, 0x0e, 0x52, 0x7f, 0x9b, 0x05, 0x68, 0x8c, 0x1f, 0x83, 0xd9, 0xab, 0x5b, 0xe0, 0xcd, 0x19,
-    ];
-    for (i, &b) in input.iter().enumerate() {
-        h[i % 32] = h[i % 32].wrapping_add(b).wrapping_mul(33u8).rotate_left(3);
-    }
-    h
-}
+use crate::wallet::{derive_key, set_private_file_permissions};
 
 pub fn parse_env_content(content: &str) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
@@ -227,7 +218,7 @@ pub fn log_env_var(var_name: &str, file_path: &Path) -> Result<()> {
 }
 
 fn derive_pass_key(pass: &str) -> [u8; 32] {
-    hash_digest(pass.as_bytes())
+    derive_key(pass)
 }
 
 pub fn get_encryption_password(env_file_name: &str) -> Result<String> {
@@ -288,6 +279,7 @@ pub fn encrypt_env_file(input_file: &Path, output_file: Option<&Path>) -> Result
     };
 
     fs::write(&target_path, payload)?;
+    set_private_file_permissions(&target_path);
     Ok(target_path)
 }
 
@@ -368,7 +360,7 @@ pub fn run_with_envs(
     command_and_args: &[String],
 ) -> Result<i32> {
     if command_and_args.is_empty() {
-        return Err(anyhow!("No command provided. Usage: clienv run -- <command>"));
+        return Err(anyhow!("No command provided. Usage: bsec run -- <command>"));
     }
 
     let mut env_map = BTreeMap::new();
@@ -386,10 +378,7 @@ pub fn run_with_envs(
     });
 
     if let Some(sec_id) = target_secret_id {
-        let user_addr = match crate::wallet::get_wallet_info(None) {
-            Ok(w) => w.address,
-            Err(_) => "0x0000000000000000000000000000000000000000".to_string(),
-        };
+        let user_addr = crate::wallet::get_wallet_info(None)?.address;
         let sec_vars = crate::secrets::load_secret_as_env(sec_id, &user_addr)?;
         env_map.extend(sec_vars);
     }
