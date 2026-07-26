@@ -110,12 +110,8 @@ fn resolve_recipient_pubkey(to_address: &str, sender_info: &crate::wallet::Walle
             .map_err(|e| anyhow!("Invalid recipient public key: {}", e));
     }
 
-    if to_address.starts_with("0x") && to_address.len() == 42 {
-        return Ok(None);
-    }
-
     Err(anyhow!(
-        "Recipient must be a valid SEC1 public key, wallet address (0x...), 'public', or your wallet address."
+        "Recipient must be a valid SEC1 public key (0x04...), your own wallet address, or 'public'. EVM addresses (0x...) of external users cannot be used for ECDH key exchange without their public key."
     ))
 }
 
@@ -147,7 +143,7 @@ pub fn share_secret(
         );
         hash_digest(shared_secret.raw_secret_bytes())
     } else {
-        hash_digest(format!("bsec_address_wrapper:{}:{}", to_address, ephemeral_pub_hex).as_bytes())
+        return Err(anyhow!("Cannot resolve recipient public key for encryption."));
     };
 
     let mut random_content_key = [0u8; 32];
@@ -189,7 +185,18 @@ pub fn view_secret(secret_id: &str, user_address: &str, password: Option<&str>) 
     let file_content = fs::read_to_string(&path)?;
     let mut record: SecretRecord = serde_json::from_str(&file_content)?;
 
-    if record.recipient != "public" && record.recipient != user_address && record.sender != user_address {
+    let wallet_info = crate::wallet::get_wallet_info(password)?;
+
+    let is_recipient = record.recipient == "public"
+        || record.recipient == wallet_info.address
+        || record.recipient == wallet_info.public_key
+        || record.recipient == user_address;
+
+    let is_sender = record.sender == wallet_info.address
+        || record.sender == wallet_info.public_key
+        || record.sender == user_address;
+
+    if !is_recipient && !is_sender {
         return Err(anyhow!("You do not have permission to view this secret."));
     }
 
@@ -204,29 +211,24 @@ pub fn view_secret(secret_id: &str, user_address: &str, password: Option<&str>) 
         return Err(anyhow!("Maximum read count exceeded for this secret."));
     }
 
-    let wallet_info = crate::wallet::get_wallet_info(password)?;
     let wrapper_key = if record.recipient == "public" {
         hash_digest(b"bsec_public_secret_wrapper_key_v1")
     } else if let Some(ref eph_hex) = record.ephemeral_pubkey {
-        if record.recipient.starts_with("0x") && record.recipient.len() == 42 && record.recipient != wallet_info.address && record.sender != user_address {
-            hash_digest(format!("bsec_address_wrapper:{}:{}", record.recipient, eph_hex).as_bytes())
-        } else {
-            let eph_bytes = hex_to_bytes(eph_hex)?;
-            let eph_public = PublicKey::from_sec1_bytes(&eph_bytes)
-                .map_err(|e| anyhow!("Invalid ephemeral public key: {}", e))?;
+        let eph_bytes = hex_to_bytes(eph_hex)?;
+        let eph_public = PublicKey::from_sec1_bytes(&eph_bytes)
+            .map_err(|e| anyhow!("Invalid ephemeral public key: {}", e))?;
 
-            let priv_bytes = hex_to_bytes(&wallet_info.private_key)?;
-            let secret_key = SecretKey::from_slice(&priv_bytes)
-                .map_err(|e| anyhow!("Invalid wallet private key: {}", e))?;
+        let priv_bytes = hex_to_bytes(&wallet_info.private_key)?;
+        let secret_key = SecretKey::from_slice(&priv_bytes)
+            .map_err(|e| anyhow!("Invalid wallet private key: {}", e))?;
 
-            let shared_secret = k256::ecdh::diffie_hellman(
-                secret_key.to_nonzero_scalar(),
-                eph_public.as_affine(),
-            );
-            hash_digest(shared_secret.raw_secret_bytes())
-        }
+        let shared_secret = k256::ecdh::diffie_hellman(
+            secret_key.to_nonzero_scalar(),
+            eph_public.as_affine(),
+        );
+        hash_digest(shared_secret.raw_secret_bytes())
     } else {
-        hash_digest(format!("bsec_wrapper_key:{}", record.recipient).as_bytes())
+        return Err(anyhow!("Corrupted secret: missing ephemeral public key"));
     };
 
     let decrypted_content_key_b64 = decrypt_text(&record.content_key, &wrapper_key)
@@ -274,6 +276,7 @@ pub fn list_secrets(
     let entries = fs::read_dir(dir)?;
     let now = crate::wallet::current_timestamp();
     let mut results = Vec::new();
+    let wallet_info_opt = crate::wallet::get_wallet_info(None).ok();
 
     for entry in entries.flatten() {
         if entry.path().extension().map_or(false, |ext| ext == "json") {
@@ -288,11 +291,16 @@ pub fn list_secrets(
                         continue;
                     }
 
+                    let is_mine = record.recipient == "public"
+                        || record.sender == user_address
+                        || record.recipient == user_address
+                        || (wallet_info_opt.as_ref().map_or(false, |w| record.recipient == w.public_key || record.sender == w.public_key));
+
                     if let Some(target) = filter_user {
                         if record.recipient != target && record.sender != target {
                             continue;
                         }
-                    } else if !all && record.recipient != "public" && record.sender != user_address && record.recipient != user_address {
+                    } else if !all && !is_mine {
                         continue;
                     }
 
@@ -321,7 +329,12 @@ pub fn revoke_secret(secret_id: &str, user_address: &str) -> Result<()> {
     let file_content = fs::read_to_string(&path)?;
     let record: SecretRecord = serde_json::from_str(&file_content)?;
 
-    if record.sender != user_address {
+    let wallet_info_opt = crate::wallet::get_wallet_info(None).ok();
+
+    let is_sender = record.sender == user_address
+        || (wallet_info_opt.as_ref().map_or(false, |w| record.sender == w.public_key || record.sender == w.address));
+
+    if !is_sender {
         return Err(anyhow!("You can only revoke secrets that you have created."));
     }
 

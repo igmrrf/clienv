@@ -240,6 +240,10 @@ enum Commands {
         /// Output encrypted file path
         #[arg(short, long)]
         out: Option<PathBuf>,
+
+        /// Encryption password
+        #[arg(short, long)]
+        password: Option<String>,
     },
 
     /// Decrypt encrypted environment files (.env.enc)
@@ -250,6 +254,10 @@ enum Commands {
         /// Output decrypted file path
         #[arg(short, long)]
         out: Option<PathBuf>,
+
+        /// Decryption password
+        #[arg(short, long)]
+        password: Option<String>,
     },
 
     /// Run a command with injected environment variables or shared secret
@@ -261,6 +269,10 @@ enum Commands {
         /// Shared Secret ID to inject
         #[arg(short, long)]
         secret: Option<String>,
+
+        /// Password for wallet or encrypted env file
+        #[arg(short = 'p', long)]
+        password: Option<String>,
 
         /// Command and arguments to execute
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
@@ -610,22 +622,30 @@ fn main() {
             }
         }
 
-        Some(Commands::Encrypt { file, out }) => {
-            match env_file::encrypt_env_file(&file, out.as_deref()) {
+        Some(Commands::Encrypt { file, out, password }) => {
+            let pwd = get_password_or_prompt(password, "Enter encryption password: ");
+            match env_file::encrypt_env_file(&file, out.as_deref(), pwd.as_deref()) {
                 Ok(target) => println!("Encrypted file saved to '{}'.", target.display()),
                 Err(e) => eprintln!("Error encrypting file: {}", e),
             }
         }
 
-        Some(Commands::Decrypt { file, out }) => {
-            match env_file::decrypt_env_file(&file, out.as_deref()) {
+        Some(Commands::Decrypt { file, out, password }) => {
+            let pwd = get_password_or_prompt(password, "Enter decryption password: ");
+            match env_file::decrypt_env_file(&file, out.as_deref(), pwd.as_deref()) {
                 Ok(target) => println!("Decrypted file saved to '{}'.", target.display()),
                 Err(e) => eprintln!("Error decrypting file: {}", e),
             }
         }
 
-        Some(Commands::Run { env, secret, command }) => {
-            match env_file::run_with_envs(env.as_deref(), secret.as_deref(), &command) {
+        Some(Commands::Run {
+            env,
+            secret,
+            password,
+            command,
+        }) => {
+            let pwd = get_password_or_prompt(password, "Enter wallet/env password (if encrypted): ");
+            match env_file::run_with_envs(env.as_deref(), secret.as_deref(), &command, pwd.as_deref()) {
                 Ok(code) => std::process::exit(code),
                 Err(e) => {
                     eprintln!("Error running command: {}", e);

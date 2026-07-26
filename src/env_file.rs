@@ -20,19 +20,27 @@ pub fn parse_env_content(content: &str) -> BTreeMap<String, String> {
         if let Some((key, val)) = trimmed.split_once('=') {
             let key = key.trim().to_string();
             let mut val_str = val.trim();
-            if let Some(pos) = val_str.find(" #") {
-                val_str = val_str[..pos].trim();
-            }
-            let mut val = val_str.to_string();
-            if (val.starts_with('\'') && val.ends_with('\''))
-                || (val.starts_with('"') && val.ends_with('"'))
-            {
-                if val.len() >= 2 {
-                    val = val[1..val.len() - 1].to_string();
+            let is_single_quoted = val_str.starts_with('\'') && val_str.ends_with('\'') && val_str.len() >= 2;
+            let is_double_quoted = val_str.starts_with('"') && val_str.ends_with('"') && val_str.len() >= 2;
+
+            let parsed_val = if is_single_quoted {
+                let inner = &val_str[1..val_str.len() - 1];
+                inner.replace("\\'", "'")
+            } else if is_double_quoted {
+                let inner = &val_str[1..val_str.len() - 1];
+                inner.replace("\\\"", "\"")
+            } else {
+                if let Some(pos) = val_str.find(" #") {
+                    val_str = val_str[..pos].trim();
+                } else if let Some(pos) = val_str.find('#') {
+                    if pos > 0 && val_str.as_bytes()[pos - 1].is_ascii_whitespace() {
+                        val_str = val_str[..pos].trim();
+                    }
                 }
-            }
-            val = val.replace("\\\"", "\"").replace("\\'", "'");
-            map.insert(key, val);
+                val_str.to_string()
+            };
+
+            map.insert(key, parsed_val);
         }
     }
     map
@@ -225,7 +233,13 @@ fn derive_pass_key(pass: &str) -> [u8; 32] {
     derive_key_legacy(pass)
 }
 
-pub fn get_encryption_password(env_file_name: &str) -> Result<String> {
+pub fn get_encryption_password(env_file_name: &str, provided_pwd: Option<&str>) -> Result<String> {
+    if let Some(p) = provided_pwd {
+        if !p.is_empty() {
+            return Ok(p.to_string());
+        }
+    }
+
     let file_stem = Path::new(env_file_name)
         .file_name()
         .and_then(|n| n.to_str())
@@ -264,18 +278,18 @@ pub fn get_encryption_password(env_file_name: &str) -> Result<String> {
     }
 
     Err(anyhow!(
-        "No encryption password found. Set $DOTENV_PASS environment variable."
+        "No encryption password found. Provide --password argument or set $DOTENV_PASS environment variable."
     ))
 }
 
-pub fn encrypt_env_file(input_file: &Path, output_file: Option<&Path>) -> Result<PathBuf> {
+pub fn encrypt_env_file(input_file: &Path, output_file: Option<&Path>, password: Option<&str>) -> Result<PathBuf> {
     let content = fs::read_to_string(input_file)?;
     let file_name = input_file.to_string_lossy().to_string();
-    let password = get_encryption_password(&file_name)?;
+    let pwd = get_encryption_password(&file_name, password)?;
 
     let mut salt = [0u8; 16];
     aes_gcm::aead::rand_core::RngCore::fill_bytes(&mut aes_gcm::aead::OsRng, &mut salt);
-    let key = crate::wallet::derive_key(&password, &salt);
+    let key = crate::wallet::derive_key(&pwd, &salt);
 
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| anyhow!("key init failed"))?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
@@ -299,19 +313,19 @@ pub fn encrypt_env_file(input_file: &Path, output_file: Option<&Path>) -> Result
     Ok(target_path)
 }
 
-pub fn decrypt_env_file(input_file: &Path, output_file: Option<&Path>) -> Result<PathBuf> {
+pub fn decrypt_env_file(input_file: &Path, output_file: Option<&Path>, password: Option<&str>) -> Result<PathBuf> {
     let payload = fs::read_to_string(input_file)?;
     let file_name = input_file.to_string_lossy().to_string();
     let clean_name = file_name.trim_end_matches(".enc").trim_end_matches(".encrypted");
-    let password = get_encryption_password(clean_name)?;
+    let pwd = get_encryption_password(clean_name, password)?;
 
     let parts: Vec<&str> = payload.trim().split(':').collect();
     let (key, nonce_b64, cipher_b64) = if parts.len() == 3 {
         let salt = BASE64_STANDARD.decode(parts[0]).map_err(|_| anyhow!("Invalid salt"))?;
-        let key = crate::wallet::derive_key(&password, &salt);
+        let key = crate::wallet::derive_key(&pwd, &salt);
         (key, parts[1], parts[2])
     } else if parts.len() == 2 {
-        let key = derive_pass_key(&password);
+        let key = derive_pass_key(&pwd);
         (key, parts[0], parts[1])
     } else {
         return Err(anyhow!("Invalid encrypted payload format"));
@@ -336,20 +350,20 @@ pub fn decrypt_env_file(input_file: &Path, output_file: Option<&Path>) -> Result
     Ok(target_path)
 }
 
-pub fn load_and_parse_env(env_path: &Path) -> Result<BTreeMap<String, String>> {
+pub fn load_and_parse_env(env_path: &Path, password: Option<&str>) -> Result<BTreeMap<String, String>> {
     let file_str = env_path.to_string_lossy();
     if file_str.ends_with(".enc") || file_str.ends_with(".encrypted") {
         let payload = fs::read_to_string(env_path)?;
         let clean_name = file_str.trim_end_matches(".enc").trim_end_matches(".encrypted");
-        let password = get_encryption_password(clean_name)?;
+        let pwd = get_encryption_password(clean_name, password)?;
 
         let parts: Vec<&str> = payload.trim().split(':').collect();
         let (key, nonce_b64, cipher_b64) = if parts.len() == 3 {
             let salt = BASE64_STANDARD.decode(parts[0]).map_err(|_| anyhow!("Invalid salt"))?;
-            let key = crate::wallet::derive_key(&password, &salt);
+            let key = crate::wallet::derive_key(&pwd, &salt);
             (key, parts[1], parts[2])
         } else if parts.len() == 2 {
-            let key = derive_pass_key(&password);
+            let key = derive_pass_key(&pwd);
             (key, parts[0], parts[1])
         } else {
             return Err(anyhow!("Invalid encrypted payload format"));
@@ -383,6 +397,7 @@ pub fn run_with_envs(
     env_file: Option<&Path>,
     secret_id: Option<&str>,
     command_and_args: &[String],
+    password: Option<&str>,
 ) -> Result<i32> {
     if command_and_args.is_empty() {
         return Err(anyhow!("No command provided. Usage: bsec run -- <command>"));
@@ -403,25 +418,25 @@ pub fn run_with_envs(
     });
 
     if let Some(sec_id) = target_secret_id {
-        let user_addr = crate::wallet::get_wallet_info(None)?.address.clone();
-        let sec_vars = crate::secrets::load_secret_as_env(sec_id, &user_addr, None)?;
+        let user_addr = crate::wallet::get_wallet_info(password)?.address.clone();
+        let sec_vars = crate::secrets::load_secret_as_env(sec_id, &user_addr, password)?;
         env_map.extend(sec_vars);
     }
 
     if let Some(file_path) = target_env_file {
         if file_path.exists() {
-            let file_vars = load_and_parse_env(file_path)?;
+            let file_vars = load_and_parse_env(file_path, password)?;
             env_map.extend(file_vars);
         }
     } else if target_secret_id.is_none() {
         let default_local = Path::new(".env.local");
         if default_local.exists() {
-            let file_vars = load_and_parse_env(default_local)?;
+            let file_vars = load_and_parse_env(default_local, password)?;
             env_map.extend(file_vars);
         } else {
             let default_env = Path::new(".env");
             if default_env.exists() {
-                let file_vars = load_and_parse_env(default_env)?;
+                let file_vars = load_and_parse_env(default_env, password)?;
                 env_map.extend(file_vars);
             }
         }

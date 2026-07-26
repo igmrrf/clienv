@@ -39,6 +39,13 @@ pub struct WalletFile {
 }
 
 pub fn get_app_dir() -> PathBuf {
+    if let Ok(bsec_home) = std::env::var("BSEC_HOME") {
+        let path = PathBuf::from(bsec_home);
+        if !path.exists() {
+            let _ = fs::create_dir_all(&path);
+        }
+        return path;
+    }
     let mut dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     dir.push(".bsec");
     if !dir.exists() {
