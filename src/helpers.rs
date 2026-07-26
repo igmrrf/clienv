@@ -9,7 +9,7 @@ use std::{
 fn find_matches(content: &str, pattern: &str, mut writer: impl std::io::Write) {
     for line in content.lines() {
         if line.contains(pattern) {
-            writeln!(writer, "{}", line).unwrap();
+            let _ = writeln!(writer, "{}", line);
         }
     }
 }
@@ -26,8 +26,13 @@ pub fn log() -> Result<(), Box<dyn Error>> {
 }
 
 pub fn search_file(path: &PathBuf, pattern: &str) {
-    let content = std::fs::read_to_string(path)
+    match std::fs::read_to_string(path)
         .with_context(|| format!("could not read file `{}`", &path.display()))
-        .unwrap();
-    find_matches(&content, pattern, &mut std::io::stdout());
+    {
+        Ok(content) => find_matches(&content, pattern, &mut std::io::stdout()),
+        Err(e) => {
+            eprintln!("Error searching file: {:#}", e);
+            std::process::exit(1);
+        }
+    }
 }

@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 mod bip39_words;
@@ -304,6 +305,17 @@ fn print_banner() {
     println!("╚═══════════════════════════════════════╝");
 }
 
+fn get_password_or_prompt(provided: Option<String>, prompt_msg: &str) -> Option<String> {
+    if provided.is_some() {
+        provided
+    } else if std::io::stdin().is_terminal() {
+        eprint!("{}", prompt_msg);
+        rpassword::read_password().ok().filter(|p| !p.is_empty())
+    } else {
+        None
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -315,7 +327,8 @@ fn main() {
             overwrite,
         }) => {
             print_banner();
-            match wallet::init_wallet(import_mnemonic, password, user_id, overwrite) {
+            let pwd = get_password_or_prompt(password, "Set wallet encryption password (optional): ");
+            match wallet::init_wallet(import_mnemonic, pwd, user_id, overwrite) {
                 Ok(info) => {
                     println!("Wallet initialized successfully!");
                     println!("Address: {}", info.address);
@@ -329,20 +342,23 @@ fn main() {
 
         Some(Commands::Wallet {
             sub: WalletCommands::Info { password },
-        }) => match wallet::get_wallet_info(password.as_deref()) {
-            Ok(info) => {
-                println!("Wallet Information:");
-                println!("-------------------");
-                println!("Address: {}", info.address);
-                println!("Public Key: {}", info.public_key);
-                if let Some(uid) = info.user_id {
-                    println!("User ID: {}", uid);
+        }) => {
+            let pwd = get_password_or_prompt(password, "Enter wallet password (if encrypted): ");
+            match wallet::get_wallet_info(pwd.as_deref()) {
+                Ok(info) => {
+                    println!("Wallet Information:");
+                    println!("-------------------");
+                    println!("Address: {}", info.address);
+                    println!("Public Key: {}", info.public_key);
+                    if let Some(ref uid) = info.user_id {
+                        println!("User ID: {}", uid);
+                    }
+                    println!("Created: {}", info.created_at);
+                    println!("Last Accessed: {}", info.last_accessed);
                 }
-                println!("Created: {}", info.created_at);
-                println!("Last Accessed: {}", info.last_accessed);
+                Err(e) => eprintln!("Error getting wallet info: {}", e),
             }
-            Err(e) => eprintln!("Error getting wallet info: {}", e),
-        },
+        }
 
         Some(Commands::Config {
             network,
@@ -398,7 +414,7 @@ fn main() {
 
             let recipient = to.unwrap_or_else(|| "public".to_string());
             let sender = match wallet::get_wallet_info(None) {
-                Ok(w) => w.address,
+                Ok(w) => w.address.clone(),
                 Err(e) => {
                     eprintln!("Error getting wallet info: {e}");
                     return;
@@ -422,8 +438,9 @@ fn main() {
             output,
             password,
         }) => {
-            let user_addr = match wallet::get_wallet_info(password.as_deref()) {
-                Ok(w) => w.address,
+            let pwd = get_password_or_prompt(password, "Enter wallet password (if encrypted): ");
+            let user_addr = match wallet::get_wallet_info(pwd.as_deref()) {
+                Ok(w) => w.address.clone(),
                 Err(e) => {
                     eprintln!("Error loading wallet: {e}");
                     return;
@@ -451,20 +468,21 @@ fn main() {
 
         Some(Commands::List {
             user,
-            all_users: _,
+            all_users,
             all,
             expired,
             active,
         }) => {
             let user_addr = match wallet::get_wallet_info(None) {
-                Ok(w) => w.address,
+                Ok(w) => w.address.clone(),
                 Err(e) => {
                     eprintln!("Error loading wallet: {e}");
                     return;
                 }
             };
 
-            match secrets::list_secrets(&user_addr, user.as_deref(), all, expired, active) {
+            let list_all = all || all_users;
+            match secrets::list_secrets(&user_addr, user.as_deref(), list_all, expired, active) {
                 Ok(list) => {
                     if list.is_empty() {
                         println!("No matching secrets found.");
@@ -488,7 +506,7 @@ fn main() {
 
         Some(Commands::Revoke { secret_id }) => {
             let user_addr = match wallet::get_wallet_info(None) {
-                Ok(w) => w.address,
+                Ok(w) => w.address.clone(),
                 Err(e) => {
                     eprintln!("Error loading wallet: {e}");
                     return;
@@ -504,17 +522,18 @@ fn main() {
         Some(Commands::Hide {
             secret_id,
             user,
-            all: _,
+            all,
         }) => {
             let user_addr = match wallet::get_wallet_info(None) {
-                Ok(w) => w.address,
+                Ok(w) => w.address.clone(),
                 Err(e) => {
                     eprintln!("Error loading wallet: {e}");
                     return;
                 }
             };
 
-            match secrets::hide_secret(secret_id.as_deref(), user.as_deref(), &user_addr) {
+            let target_id = if all { None } else { secret_id.as_deref() };
+            match secrets::hide_secret(target_id, user.as_deref(), &user_addr) {
                 Ok(count) => println!("Hidden {} secret(s).", count),
                 Err(e) => eprintln!("Error hiding secret: {}", e),
             }

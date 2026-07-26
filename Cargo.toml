@@ -22,12 +22,20 @@ aes-gcm = "0.10.3"
 base64 = "0.22.1"
 dotenv = "0.15.0"
 confy = "0.6.1"
-indicatif = "0.17.11"
 lazy_static = "1.5.0"
 sha2 = "0.10.8"
+serde_yaml = "0.9.34"
 tempfile = "3.19.0"
+dirs = "6.0.0"
+zeroize = { version = "1.8.1", features = ["derive"] }
+rpassword = "7.3.0"
+argon2 = "0.5.3"
+bip39 = "2.1.0"
+k256 = { version = "0.13.4", features = ["ecdsa", "arithmetic", "ecdh"] }
+rand = "0.8.5"
 
 [dev-dependencies]
 assert_cmd = "2.0.16"
 assert_fs = "1.1.2"
 predicates = "3.1.3"
+

@@ -13,9 +13,14 @@ lazy_static! {
     static ref ENV_VARS: Mutex<HashMap<String, String>> = Mutex::new(load_env_variables());
 }
 
+fn get_storage_path() -> std::path::PathBuf {
+    crate::wallet::get_app_dir().join("env_vars.json")
+}
+
 #[allow(dead_code)]
 pub fn load_env_variables() -> HashMap<String, String> {
-    if let Ok(data) = fs::read_to_string("env_vars.json") {
+    let path = get_storage_path();
+    if let Ok(data) = fs::read_to_string(&path) {
         serde_json::from_str(&data).unwrap_or_default()
     } else {
         HashMap::new()
@@ -23,9 +28,10 @@ pub fn load_env_variables() -> HashMap<String, String> {
 }
 
 fn save_env_variables(env_vars: &HashMap<String, String>) {
+    let path = get_storage_path();
     if let Ok(data) = serde_json::to_string_pretty(env_vars) {
-        let _ = fs::write("env_vars.json", data);
-        set_private_file_permissions(std::path::Path::new("env_vars.json"));
+        let _ = fs::write(&path, data);
+        set_private_file_permissions(&path);
     }
 }
 
@@ -43,7 +49,7 @@ pub fn set_env_variable(key: &str, value: &str, encryption_key: &str) {
 }
 
 pub fn encrypt(plaintext: &str, key: &str) -> Result<String> {
-    let k = derive_key(key);
+    let k = derive_key(key, b"bsec_manager_salt");
     let cipher = Aes256Gcm::new_from_slice(&k).map_err(|_| anyhow!("Cipher init failed"))?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let cipher_text = cipher
@@ -57,7 +63,7 @@ pub fn encrypt(plaintext: &str, key: &str) -> Result<String> {
 }
 
 pub fn decrypt(cipher_text: &str, key: &str) -> Result<String> {
-    let k = derive_key(key);
+    let k = derive_key(key, b"bsec_manager_salt");
     let cipher = Aes256Gcm::new_from_slice(&k).map_err(|_| anyhow!("Cipher init failed"))?;
     let parts: Vec<&str> = cipher_text.split(':').collect();
     if parts.len() != 2 {

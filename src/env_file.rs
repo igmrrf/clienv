@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::wallet::{derive_key, set_private_file_permissions};
+use crate::wallet::{derive_key_legacy, set_private_file_permissions};
 
 pub fn parse_env_content(content: &str) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
@@ -19,7 +19,11 @@ pub fn parse_env_content(content: &str) -> BTreeMap<String, String> {
         }
         if let Some((key, val)) = trimmed.split_once('=') {
             let key = key.trim().to_string();
-            let mut val = val.trim().to_string();
+            let mut val_str = val.trim();
+            if let Some(pos) = val_str.find(" #") {
+                val_str = val_str[..pos].trim();
+            }
+            let mut val = val_str.to_string();
             if (val.starts_with('\'') && val.ends_with('\''))
                 || (val.starts_with('"') && val.ends_with('"'))
             {
@@ -27,6 +31,7 @@ pub fn parse_env_content(content: &str) -> BTreeMap<String, String> {
                     val = val[1..val.len() - 1].to_string();
                 }
             }
+            val = val.replace("\\\"", "\"").replace("\\'", "'");
             map.insert(key, val);
         }
     }
@@ -113,13 +118,7 @@ pub fn convert_env_file(
                 }
                 serde_json::to_string_pretty(&json_obj)?
             }
-            "yaml" | "yml" => {
-                let mut lines = Vec::new();
-                for (k, v) in map {
-                    lines.push(format!("{}: \"{}\"", k, v));
-                }
-                lines.join("\n")
-            }
+            "yaml" | "yml" => serde_yaml::to_string(&map)?,
             _ => {
                 let mut lines = Vec::new();
                 for (k, v) in map {
@@ -218,7 +217,7 @@ pub fn log_env_var(var_name: &str, file_path: &Path) -> Result<()> {
 }
 
 fn derive_pass_key(pass: &str) -> [u8; 32] {
-    derive_key(pass)
+    derive_key_legacy(pass)
 }
 
 pub fn get_encryption_password(env_file_name: &str) -> Result<String> {
@@ -251,7 +250,7 @@ pub fn get_encryption_password(env_file_name: &str) -> Result<String> {
     }
 
     Err(anyhow!(
-        "No encryption password found. Set $DOTENV_PASS or create .env.pass file."
+        "No encryption password found. Set $DOTENV_PASS environment variable."
     ))
 }
 
@@ -378,7 +377,7 @@ pub fn run_with_envs(
     });
 
     if let Some(sec_id) = target_secret_id {
-        let user_addr = crate::wallet::get_wallet_info(None)?.address;
+        let user_addr = crate::wallet::get_wallet_info(None)?.address.clone();
         let sec_vars = crate::secrets::load_secret_as_env(sec_id, &user_addr)?;
         env_map.extend(sec_vars);
     }

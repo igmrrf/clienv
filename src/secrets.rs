@@ -3,12 +3,14 @@ use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Nonce};
 use base64::prelude::*;
+use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::wallet::{bytes_to_hex, hash_digest, set_private_file_permissions};
+use crate::wallet::{bytes_to_hex, hash_digest, hex_to_bytes, set_private_file_permissions};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SecretRecord {
@@ -17,6 +19,7 @@ pub struct SecretRecord {
     pub recipient: String,
     pub content: String,
     pub content_key: String,
+    pub ephemeral_pubkey: Option<String>,
     pub created_at: u64,
     pub expires_at: u64,
     pub max_reads: u32,
@@ -88,6 +91,24 @@ fn decrypt_text(cipher_str: &str, key_bytes: &[u8; 32]) -> Result<String> {
     String::from_utf8(plain_bytes).map_err(|e| anyhow!("utf8 error: {}", e))
 }
 
+fn resolve_recipient_pubkey(to_address: &str, sender_info: &crate::wallet::WalletInfo) -> Result<PublicKey> {
+    if to_address == sender_info.address || to_address == sender_info.public_key || to_address == "public" {
+        let pub_bytes = hex_to_bytes(&sender_info.public_key)?;
+        return PublicKey::from_sec1_bytes(&pub_bytes)
+            .map_err(|e| anyhow!("Invalid sender public key: {}", e));
+    }
+
+    if to_address.starts_with("0x04") || to_address.starts_with("04") || to_address.starts_with("0x02") || to_address.starts_with("0x03") {
+        let pub_bytes = hex_to_bytes(to_address)?;
+        return PublicKey::from_sec1_bytes(&pub_bytes)
+            .map_err(|e| anyhow!("Invalid recipient public key: {}", e));
+    }
+
+    Err(anyhow!(
+        "Recipient must be a valid SEC1 public key (starting with 0x04, 0x02, or 0x03), 'public', or your wallet address."
+    ))
+}
+
 pub fn share_secret(
     content: &str,
     ttl_str: &str,
@@ -99,22 +120,36 @@ pub fn share_secret(
     let now = crate::wallet::current_timestamp();
     let expires_at = now + ttl_secs;
 
-    let mut random_key = [0u8; 32];
-    OsRng.fill_bytes(&mut random_key);
+    let sender_info = crate::wallet::get_wallet_info(None)?;
+    let recipient_pubkey = resolve_recipient_pubkey(to_address, &sender_info)?;
 
-    let encrypted_content = encrypt_text(content, &random_key);
-    let content_key_b64 = BASE64_STANDARD.encode(&random_key);
+    let ephemeral_secret = SecretKey::random(&mut OsRng);
+    let ephemeral_public = ephemeral_secret.public_key();
+    let shared_secret = k256::ecdh::diffie_hellman(
+        ephemeral_secret.to_nonzero_scalar(),
+        recipient_pubkey.as_affine(),
+    );
+    let wrapper_key = hash_digest(shared_secret.raw_secret_bytes());
+
+    let mut random_content_key = [0u8; 32];
+    OsRng.fill_bytes(&mut random_content_key);
+
+    let encrypted_content = encrypt_text(content, &random_content_key);
+    let encrypted_content_key = encrypt_text(&BASE64_STANDARD.encode(&random_content_key), &wrapper_key);
 
     let id_seed = format!("{}:{}:{}", sender_address, to_address, now);
     let id_hash = bytes_to_hex(&hash_digest(id_seed.as_bytes()));
     let secret_id = id_hash[0..16].to_string();
+
+    let ephemeral_pub_hex = format!("0x{}", bytes_to_hex(ephemeral_public.to_encoded_point(false).as_bytes()));
 
     let record = SecretRecord {
         id: secret_id.clone(),
         sender: sender_address.to_string(),
         recipient: to_address.to_string(),
         content: encrypted_content,
-        content_key: content_key_b64,
+        content_key: encrypted_content_key,
+        ephemeral_pubkey: Some(ephemeral_pub_hex),
         created_at: now,
         expires_at,
         max_reads,
@@ -153,9 +188,30 @@ pub fn view_secret(secret_id: &str, user_address: &str) -> Result<String> {
         return Err(anyhow!("Maximum read count exceeded for this secret."));
     }
 
-    // Decrypt BEFORE mutating state
+    let wallet_info = crate::wallet::get_wallet_info(None)?;
+    let wrapper_key = if let Some(ref eph_hex) = record.ephemeral_pubkey {
+        let eph_bytes = hex_to_bytes(eph_hex)?;
+        let eph_public = PublicKey::from_sec1_bytes(&eph_bytes)
+            .map_err(|e| anyhow!("Invalid ephemeral public key: {}", e))?;
+
+        let priv_bytes = hex_to_bytes(&wallet_info.private_key)?;
+        let secret_key = SecretKey::from_slice(&priv_bytes)
+            .map_err(|e| anyhow!("Invalid wallet private key: {}", e))?;
+
+        let shared_secret = k256::ecdh::diffie_hellman(
+            secret_key.to_nonzero_scalar(),
+            eph_public.as_affine(),
+        );
+        hash_digest(shared_secret.raw_secret_bytes())
+    } else {
+        hash_digest(format!("bsec_wrapper_key:{}", record.recipient).as_bytes())
+    };
+
+    let decrypted_content_key_b64 = decrypt_text(&record.content_key, &wrapper_key)
+        .map_err(|_| anyhow!("Failed to decrypt content key for secret"))?;
+
     let key_bytes_vec = BASE64_STANDARD
-        .decode(&record.content_key)
+        .decode(&decrypted_content_key_b64)
         .map_err(|_| anyhow!("Failed to decode content key"))?;
     let mut key_bytes = [0u8; 32];
     if key_bytes_vec.len() != 32 {
@@ -165,7 +221,6 @@ pub fn view_secret(secret_id: &str, user_address: &str) -> Result<String> {
 
     let decrypted = decrypt_text(&record.content, &key_bytes)?;
 
-    // Increment read count only after successful decryption
     record.read_count += 1;
 
     if record.read_count >= record.max_reads {
