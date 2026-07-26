@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::sync::Mutex;
 
-use crate::wallet::{derive_key, set_private_file_permissions};
+use crate::wallet::{derive_key, write_secure_file};
 
 lazy_static! {
     static ref ENV_VARS: Mutex<HashMap<String, String>> = Mutex::new(load_env_variables());
@@ -30,8 +30,7 @@ pub fn load_env_variables() -> HashMap<String, String> {
 fn save_env_variables(env_vars: &HashMap<String, String>) {
     let path = get_storage_path();
     if let Ok(data) = serde_json::to_string_pretty(env_vars) {
-        let _ = fs::write(&path, data);
-        set_private_file_permissions(&path);
+        let _ = write_secure_file(&path, data.as_bytes());
     }
 }
 

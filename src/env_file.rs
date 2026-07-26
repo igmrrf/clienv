@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::wallet::{derive_key_legacy, set_private_file_permissions};
+use crate::wallet::{derive_key_legacy, write_secure_file};
 
 pub fn parse_env_content(content: &str) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
@@ -167,7 +167,12 @@ pub fn validate_env_file(schema_path: &Path, env_path: &Path) -> Result<()> {
         for key in &missing_keys {
             println!("  - {}", key);
         }
-        let mut new_lines = vec![env_content.trim_end().to_string()];
+        let trimmed_content = env_content.trim_end();
+        let mut new_lines = if trimmed_content.is_empty() {
+            Vec::new()
+        } else {
+            vec![trimmed_content.to_string()]
+        };
         for key in missing_keys {
             new_lines.push(format!("{}=", key));
         }
@@ -226,9 +231,18 @@ pub fn get_encryption_password(env_file_name: &str) -> Result<String> {
         .and_then(|n| n.to_str())
         .unwrap_or(env_file_name);
 
-    let clean_stem = file_stem.replace('.', "_").to_uppercase();
+    let clean_stem = file_stem
+        .trim_start_matches('.')
+        .replace('.', "_")
+        .to_uppercase();
+
     let env_specific_var = format!("DOTENV_{}_PASS", clean_stem);
     if let Ok(val) = std::env::var(&env_specific_var) {
+        return Ok(val);
+    }
+
+    let alt_var = format!("DOTENV_{}_PASS", clean_stem.trim_start_matches("ENV_"));
+    if let Ok(val) = std::env::var(&alt_var) {
         return Ok(val);
     }
 
@@ -258,7 +272,10 @@ pub fn encrypt_env_file(input_file: &Path, output_file: Option<&Path>) -> Result
     let content = fs::read_to_string(input_file)?;
     let file_name = input_file.to_string_lossy().to_string();
     let password = get_encryption_password(&file_name)?;
-    let key = derive_pass_key(&password);
+
+    let mut salt = [0u8; 16];
+    aes_gcm::aead::rand_core::RngCore::fill_bytes(&mut aes_gcm::aead::OsRng, &mut salt);
+    let key = crate::wallet::derive_key(&password, &salt);
 
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| anyhow!("key init failed"))?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
@@ -267,7 +284,8 @@ pub fn encrypt_env_file(input_file: &Path, output_file: Option<&Path>) -> Result
         .map_err(|_| anyhow!("encryption failed"))?;
 
     let payload = format!(
-        "{}:{}",
+        "{}:{}:{}",
+        BASE64_STANDARD.encode(salt),
         BASE64_STANDARD.encode(nonce),
         BASE64_STANDARD.encode(cipher_text)
     );
@@ -277,8 +295,7 @@ pub fn encrypt_env_file(input_file: &Path, output_file: Option<&Path>) -> Result
         None => PathBuf::from(format!("{}.enc", input_file.display())),
     };
 
-    fs::write(&target_path, payload)?;
-    set_private_file_permissions(&target_path);
+    write_secure_file(&target_path, payload.as_bytes())?;
     Ok(target_path)
 }
 
@@ -287,21 +304,23 @@ pub fn decrypt_env_file(input_file: &Path, output_file: Option<&Path>) -> Result
     let file_name = input_file.to_string_lossy().to_string();
     let clean_name = file_name.trim_end_matches(".enc").trim_end_matches(".encrypted");
     let password = get_encryption_password(clean_name)?;
-    let key = derive_pass_key(&password);
+
+    let parts: Vec<&str> = payload.trim().split(':').collect();
+    let (key, nonce_b64, cipher_b64) = if parts.len() == 3 {
+        let salt = BASE64_STANDARD.decode(parts[0]).map_err(|_| anyhow!("Invalid salt"))?;
+        let key = crate::wallet::derive_key(&password, &salt);
+        (key, parts[1], parts[2])
+    } else if parts.len() == 2 {
+        let key = derive_pass_key(&password);
+        (key, parts[0], parts[1])
+    } else {
+        return Err(anyhow!("Invalid encrypted payload format"));
+    };
 
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| anyhow!("key init failed"))?;
-    let parts: Vec<&str> = payload.split(':').collect();
-    if parts.len() != 2 {
-        return Err(anyhow!("Invalid encrypted payload format"));
-    }
-
-    let nonce_bytes = BASE64_STANDARD
-        .decode(parts[0])
-        .map_err(|_| anyhow!("Invalid nonce"))?;
+    let nonce_bytes = BASE64_STANDARD.decode(nonce_b64).map_err(|_| anyhow!("Invalid nonce"))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let cipher_bytes = BASE64_STANDARD
-        .decode(parts[1])
-        .map_err(|_| anyhow!("Invalid cipher text"))?;
+    let cipher_bytes = BASE64_STANDARD.decode(cipher_b64).map_err(|_| anyhow!("Invalid cipher text"))?;
 
     let plain_bytes = cipher
         .decrypt(nonce, cipher_bytes.as_ref())
@@ -323,16 +342,23 @@ pub fn load_and_parse_env(env_path: &Path) -> Result<BTreeMap<String, String>> {
         let payload = fs::read_to_string(env_path)?;
         let clean_name = file_str.trim_end_matches(".enc").trim_end_matches(".encrypted");
         let password = get_encryption_password(clean_name)?;
-        let key = derive_pass_key(&password);
+
+        let parts: Vec<&str> = payload.trim().split(':').collect();
+        let (key, nonce_b64, cipher_b64) = if parts.len() == 3 {
+            let salt = BASE64_STANDARD.decode(parts[0]).map_err(|_| anyhow!("Invalid salt"))?;
+            let key = crate::wallet::derive_key(&password, &salt);
+            (key, parts[1], parts[2])
+        } else if parts.len() == 2 {
+            let key = derive_pass_key(&password);
+            (key, parts[0], parts[1])
+        } else {
+            return Err(anyhow!("Invalid encrypted payload format"));
+        };
 
         let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| anyhow!("key init failed"))?;
-        let parts: Vec<&str> = payload.split(':').collect();
-        if parts.len() != 2 {
-            return Err(anyhow!("Invalid encrypted payload format"));
-        }
-        let nonce_bytes = BASE64_STANDARD.decode(parts[0])?;
+        let nonce_bytes = BASE64_STANDARD.decode(nonce_b64)?;
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let cipher_bytes = BASE64_STANDARD.decode(parts[1])?;
+        let cipher_bytes = BASE64_STANDARD.decode(cipher_b64)?;
         let plain_bytes = cipher
             .decrypt(nonce, cipher_bytes.as_ref())
             .map_err(|_| anyhow!("Decryption failed. Check password."))?;
@@ -378,7 +404,7 @@ pub fn run_with_envs(
 
     if let Some(sec_id) = target_secret_id {
         let user_addr = crate::wallet::get_wallet_info(None)?.address.clone();
-        let sec_vars = crate::secrets::load_secret_as_env(sec_id, &user_addr)?;
+        let sec_vars = crate::secrets::load_secret_as_env(sec_id, &user_addr, None)?;
         env_map.extend(sec_vars);
     }
 
@@ -413,5 +439,19 @@ pub fn run_with_envs(
     child.stderr(Stdio::inherit());
 
     let status = child.status()?;
-    Ok(status.code().unwrap_or(0))
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(code) = status.code() {
+            Ok(code)
+        } else if let Some(sig) = status.signal() {
+            Ok(128 + sig)
+        } else {
+            Ok(1)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(status.code().unwrap_or(1))
+    }
 }

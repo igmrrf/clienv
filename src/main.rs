@@ -102,6 +102,10 @@ enum Commands {
         /// Recipient wallet address or user ID
         #[arg(short = 'u', long = "to")]
         to: Option<String>,
+
+        /// Password to unlock wallet if required
+        #[arg(short, long)]
+        password: Option<String>,
     },
 
     /// View a shared secret
@@ -139,12 +143,20 @@ enum Commands {
         /// List active secrets only
         #[arg(long)]
         active: bool,
+
+        /// Password to unlock wallet if required
+        #[arg(short, long)]
+        password: Option<String>,
     },
 
     /// Revoke access to a shared secret
     Revoke {
         /// Secret ID to revoke
         secret_id: String,
+
+        /// Password to unlock wallet if required
+        #[arg(short, long)]
+        password: Option<String>,
     },
 
     /// Hide shared secret(s)
@@ -159,6 +171,10 @@ enum Commands {
         /// Hide all secrets
         #[arg(long)]
         all: bool,
+
+        /// Password to unlock wallet if required
+        #[arg(short, long)]
+        password: Option<String>,
     },
 
     /// Convert between environment file formats (JSON, YAML, .env)
@@ -394,6 +410,7 @@ fn main() {
             ttl,
             max_reads,
             to,
+            password,
         }) => {
             let secret_content = if let Some(c) = content {
                 c
@@ -412,8 +429,9 @@ fn main() {
                 return;
             };
 
+            let pwd = get_password_or_prompt(password, "Enter wallet password (if encrypted): ");
             let recipient = to.unwrap_or_else(|| "public".to_string());
-            let sender = match wallet::get_wallet_info(None) {
+            let sender = match wallet::get_wallet_info(pwd.as_deref()) {
                 Ok(w) => w.address.clone(),
                 Err(e) => {
                     eprintln!("Error getting wallet info: {e}");
@@ -421,7 +439,7 @@ fn main() {
                 }
             };
 
-            match secrets::share_secret(&secret_content, &ttl, max_reads, &recipient, &sender) {
+            match secrets::share_secret(&secret_content, &ttl, max_reads, &recipient, &sender, pwd.as_deref()) {
                 Ok(rec) => {
                     println!("Secret shared successfully!");
                     println!("Secret ID: {}", rec.id);
@@ -447,7 +465,7 @@ fn main() {
                 }
             };
 
-            match secrets::view_secret(&secret_id, &user_addr) {
+            match secrets::view_secret(&secret_id, &user_addr, pwd.as_deref()) {
                 Ok(content) => {
                     if let Some(out_path) = output {
                         if let Err(e) = std::fs::write(&out_path, &content) {
@@ -472,8 +490,10 @@ fn main() {
             all,
             expired,
             active,
+            password,
         }) => {
-            let user_addr = match wallet::get_wallet_info(None) {
+            let pwd = get_password_or_prompt(password, "Enter wallet password (if encrypted): ");
+            let user_addr = match wallet::get_wallet_info(pwd.as_deref()) {
                 Ok(w) => w.address.clone(),
                 Err(e) => {
                     eprintln!("Error loading wallet: {e}");
@@ -504,8 +524,9 @@ fn main() {
             }
         }
 
-        Some(Commands::Revoke { secret_id }) => {
-            let user_addr = match wallet::get_wallet_info(None) {
+        Some(Commands::Revoke { secret_id, password }) => {
+            let pwd = get_password_or_prompt(password, "Enter wallet password (if encrypted): ");
+            let user_addr = match wallet::get_wallet_info(pwd.as_deref()) {
                 Ok(w) => w.address.clone(),
                 Err(e) => {
                     eprintln!("Error loading wallet: {e}");
@@ -523,8 +544,10 @@ fn main() {
             secret_id,
             user,
             all,
+            password,
         }) => {
-            let user_addr = match wallet::get_wallet_info(None) {
+            let pwd = get_password_or_prompt(password, "Enter wallet password (if encrypted): ");
+            let user_addr = match wallet::get_wallet_info(pwd.as_deref()) {
                 Ok(w) => w.address.clone(),
                 Err(e) => {
                     eprintln!("Error loading wallet: {e}");

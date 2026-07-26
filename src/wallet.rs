@@ -66,6 +66,28 @@ pub fn set_private_file_permissions(path: &Path) {
     }
 }
 
+pub fn write_secure_file(path: &Path, content: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(content)?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, content)?;
+    }
+    set_private_file_permissions(path);
+    Ok(())
+}
+
+
 pub fn hash_digest(input: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(input);
@@ -249,16 +271,14 @@ pub fn init_wallet(
         }
     };
 
-    fs::write(&wallet_path, serde_json::to_string_pretty(&wallet_file)?)?;
-    set_private_file_permissions(&wallet_path);
+    write_secure_file(&wallet_path, serde_json::to_string_pretty(&wallet_file)?.as_bytes())?;
 
     let config = WalletConfig {
         address: address.clone(),
         created_at: now,
         user_id,
     };
-    fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
-    set_private_file_permissions(&config_path);
+    write_secure_file(&config_path, serde_json::to_string_pretty(&config)?.as_bytes())?;
 
     Ok(wallet_info)
 }
