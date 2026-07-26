@@ -20,8 +20,19 @@ fn load_env_variables() -> HashMap<String, String> {
 
 fn save_env_variables(env_vars: &HashMap<String, String>) {
     if let Ok(data) = serde_json::to_string_pretty(env_vars) {
-        fs::write("env_vars.json", data).unwrap();
+        let _ = fs::write("env_vars.json", data);
     }
+}
+
+fn pad_or_hash_key(key: &str) -> [u8; 32] {
+    let mut k = [
+        0x6a, 0x09, 0xe6, 0x67, 0xbb, 0x67, 0xae, 0x85, 0x3c, 0x6e, 0xf3, 0x72, 0xa5, 0x4f, 0x53, 0x79,
+        0x51, 0x0e, 0x52, 0x7f, 0x9b, 0x05, 0x68, 0x8c, 0x1f, 0x83, 0xd9, 0xab, 0x5b, 0xe0, 0xcd, 0x19,
+    ];
+    for (i, &b) in key.as_bytes().iter().enumerate() {
+        k[i % 32] ^= b;
+    }
+    k
 }
 
 pub fn get_env_variable(key: &str, encryption_key: &str) -> Option<String> {
@@ -32,11 +43,12 @@ pub fn get_env_variable(key: &str, encryption_key: &str) -> Option<String> {
 pub fn set_env_variable(key: &str, value: &str, encryption_key: &str) {
     let mut env_vars = ENV_VARS.lock().unwrap();
     env_vars.insert(key.to_string(), encrypt(value, encryption_key));
-    save_env_variables(&env_vars)
+    save_env_variables(&env_vars);
 }
 
 pub fn encrypt(plaintext: &str, key: &str) -> String {
-    let cipher = Aes256Gcm::new_from_slice(key.as_bytes()).expect("failed to cipher");
+    let k = pad_or_hash_key(key);
+    let cipher = Aes256Gcm::new_from_slice(&k).expect("failed to cipher");
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let cipher_text = cipher
         .encrypt(&nonce, plaintext.as_bytes())
@@ -49,8 +61,9 @@ pub fn encrypt(plaintext: &str, key: &str) -> String {
 }
 
 pub fn decrypt(cipher_text: &str, key: &str) -> String {
-    let cipher = Aes256Gcm::new_from_slice(key.as_bytes()).expect("failed to cipher");
-    let parts: Vec<&str> = cipher_text.split(":").collect();
+    let k = pad_or_hash_key(key);
+    let cipher = Aes256Gcm::new_from_slice(&k).expect("failed to cipher");
+    let parts: Vec<&str> = cipher_text.split(':').collect();
     let decoded = BASE64_STANDARD.decode(parts[0]).expect("invalid nonce");
     let nonce = Nonce::from_slice(&decoded);
     let cipher_text = BASE64_STANDARD

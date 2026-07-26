@@ -1,0 +1,60 @@
+name: clienv-testnet
+
+services:
+  # Local EVM Testnet Node (Anvil - Foundry)
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    container_name: clienv-local-testnet
+    restart: unless-stopped
+    command: >
+      anvil
+      --host 0.0.0.0
+      --port 8545
+      --chain-id 31337
+      --block-time 1
+      --accounts 10
+      --balance 10000
+    ports:
+      - "8545:8545"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 8545 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
+
+  # Local IPFS Gateway & Pinning node for decentralized secret storage testing
+  ipfs:
+    image: ipfs/kubo:latest
+    container_name: clienv-local-ipfs
+    restart: unless-stopped
+    ports:
+      - "4001:4001"
+      - "5001:5001"
+      - "8080:8080"
+    environment:
+      - IPFS_PATH=/data/ipfs
+    volumes:
+      - ipfs_data:/data/ipfs
+    healthcheck:
+      test: ["CMD", "ipfs", "id"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+volumes:
+  ipfs_data:
