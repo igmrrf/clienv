@@ -1,8 +1,17 @@
+//! Unit Tests for Application Global Configuration
+//!
+//! Target File: `src/config.rs`
+//! Flow Tested:
+//!   - `Config::default()` resolution and `ENCRYPTION_KEY` environment variable override
+//!   - `get_config()` confy configuration loader fallback
+
 #[cfg(test)]
 mod tests {
     use crate::config::*;
     use std::env;
 
+    /// Tests default encryption key fallbacks and custom ENCRYPTION_KEY environment overrides.
+    /// Target File: `src/config.rs` -> `Config::default()`
     #[test]
     fn test_config_defaults_and_override() {
         unsafe {
@@ -22,9 +31,12 @@ mod tests {
         }
     }
 
+    /// Tests loading configuration via confy.
+    /// Target File: `src/config.rs` -> `get_config()`
     #[test]
     fn test_get_config() {
         let config = get_config();
         assert!(!config.encryption_key.is_empty());
     }
 }
+

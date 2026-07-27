@@ -359,6 +359,7 @@ fn print_banner() {
 
 fn get_password_or_prompt(provided: Option<String>, prompt_msg: &str) -> Option<String> {
     if provided.is_some() {
+        eprintln!("Warning: Passing passwords via CLI flags may expose credentials in process lists.");
         provided
     } else if std::io::stdin().is_terminal() {
         eprint!("{}", prompt_msg);
@@ -366,6 +367,27 @@ fn get_password_or_prompt(provided: Option<String>, prompt_msg: &str) -> Option<
     } else {
         None
     }
+}
+
+fn handle_cli_error(prefix: &str, err: anyhow::Error) -> ! {
+    eprintln!("{}: {}", prefix, err);
+    if let Some(bsec_err) = err.downcast_ref::<errors::BsecError>() {
+        std::process::exit(bsec_err.exit_code());
+    }
+
+    let msg = err.to_string().to_lowercase();
+    let code = if msg.contains("password") || msg.contains("corrupted") {
+        2
+    } else if msg.contains("not found") || msg.contains("expired") || msg.contains("permission") {
+        3
+    } else if msg.contains("io") || msg.contains("parse") || msg.contains("config") || msg.contains("file") {
+        4
+    } else if msg.contains("mnemonic") || msg.contains("recipient") {
+        5
+    } else {
+        1
+    };
+    std::process::exit(code);
 }
 
 fn main() {
@@ -388,7 +410,7 @@ fn main() {
                     println!("\nIMPORTANT: Please write down your mnemonic phrase and keep it safe:");
                     println!("{}", info.mnemonic);
                 }
-                Err(e) => eprintln!("Error initializing wallet: {}", e),
+                Err(e) => handle_cli_error("Error initializing wallet", e),
             }
         }
 
@@ -419,7 +441,7 @@ fn main() {
                         println!("Last Accessed: {}", info.last_accessed);
                     }
                 }
-                Err(e) => eprintln!("Error getting wallet info: {}", e),
+                Err(e) => handle_cli_error("Error getting wallet info", e),
             }
         }
 
@@ -460,7 +482,7 @@ fn main() {
                             println!("Configuration updated: Network = {}", conf.network);
                         }
                     }
-                    Err(e) => eprintln!("Error updating config: {}", e),
+                    Err(e) => handle_cli_error("Error updating config", e),
                 }
             }
         }
@@ -479,26 +501,20 @@ fn main() {
             } else if let Some(ref path) = file {
                 match std::fs::read_to_string(path) {
                     Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("Error reading file: {}", e);
-                        return;
-                    }
+                    Err(e) => handle_cli_error("Error reading file", e.into()),
                 }
             } else if let Some(s) = secret {
                 s
             } else {
                 eprintln!("Error: Content to share is required. Use --content, --file, or positional secret text.");
-                return;
+                std::process::exit(1);
             };
 
             let pwd = get_password_or_prompt(password, "Enter wallet password (if encrypted): ");
             let recipient = to.unwrap_or_else(|| "public".to_string());
             let sender = match wallet::get_wallet_info(pwd.as_deref()) {
                 Ok(w) => w.address.clone(),
-                Err(e) => {
-                    eprintln!("Error getting wallet info: {e}");
-                    return;
-                }
+                Err(e) => handle_cli_error("Error getting wallet info", e),
             };
 
             match secrets::share_secret(&secret_content, &ttl, max_reads, &recipient, &sender, pwd.as_deref()) {
@@ -509,7 +525,7 @@ fn main() {
                     println!("Max Reads: {}", rec.max_reads);
                     println!("To view this secret, run: bsec view {}", rec.id);
                 }
-                Err(e) => eprintln!("Error sharing secret: {}", e),
+                Err(e) => handle_cli_error("Error sharing secret", e),
             }
         }
 
@@ -522,10 +538,7 @@ fn main() {
             let pwd = get_password_or_prompt(password, "Enter wallet password (if encrypted): ");
             let user_addr = match wallet::get_wallet_info(pwd.as_deref()) {
                 Ok(w) => w.address.clone(),
-                Err(e) => {
-                    eprintln!("Error loading wallet: {e}");
-                    return;
-                }
+                Err(e) => handle_cli_error("Error loading wallet", e),
             };
 
             match secrets::view_secret(&secret_id, &user_addr, pwd.as_deref()) {
@@ -540,6 +553,7 @@ fn main() {
                     } else if let Some(out_path) = output {
                         if let Err(e) = std::fs::write(&out_path, &content) {
                             eprintln!("Error writing output file: {}", e);
+                            std::process::exit(1);
                         } else {
                             println!("Secret saved to: {}", out_path.display());
                         }
@@ -550,7 +564,7 @@ fn main() {
                         println!("-------------------");
                     }
                 }
-                Err(e) => eprintln!("Error viewing secret: {}", e),
+                Err(e) => handle_cli_error("Error viewing secret", e),
             }
         }
 
@@ -566,10 +580,7 @@ fn main() {
             let pwd = get_password_or_prompt(password, "Enter wallet password (if encrypted): ");
             let user_addr = match wallet::get_wallet_info(pwd.as_deref()) {
                 Ok(w) => w.address.clone(),
-                Err(e) => {
-                    eprintln!("Error loading wallet: {e}");
-                    return;
-                }
+                Err(e) => handle_cli_error("Error loading wallet", e),
             };
 
             let list_all = all || all_users;
@@ -595,7 +606,7 @@ fn main() {
                         }
                     }
                 }
-                Err(e) => eprintln!("Error listing secrets: {}", e),
+                Err(e) => handle_cli_error("Error listing secrets", e),
             }
         }
 
@@ -603,15 +614,12 @@ fn main() {
             let pwd = get_password_or_prompt(password, "Enter wallet password (if encrypted): ");
             let user_addr = match wallet::get_wallet_info(pwd.as_deref()) {
                 Ok(w) => w.address.clone(),
-                Err(e) => {
-                    eprintln!("Error loading wallet: {e}");
-                    return;
-                }
+                Err(e) => handle_cli_error("Error loading wallet", e),
             };
 
             match secrets::revoke_secret(&secret_id, &user_addr) {
                 Ok(_) => println!("Secret '{}' has been revoked.", secret_id),
-                Err(e) => eprintln!("Error revoking secret: {}", e),
+                Err(e) => handle_cli_error("Error revoking secret", e),
             }
         }
 
@@ -624,16 +632,13 @@ fn main() {
             let pwd = get_password_or_prompt(password, "Enter wallet password (if encrypted): ");
             let user_addr = match wallet::get_wallet_info(pwd.as_deref()) {
                 Ok(w) => w.address.clone(),
-                Err(e) => {
-                    eprintln!("Error loading wallet: {e}");
-                    return;
-                }
+                Err(e) => handle_cli_error("Error loading wallet", e),
             };
 
             let target_id = if all { None } else { secret_id.as_deref() };
             match secrets::hide_secret(target_id, user.as_deref(), &user_addr) {
                 Ok(count) => println!("Hidden {} secret(s).", count),
-                Err(e) => eprintln!("Error hiding secret: {}", e),
+                Err(e) => handle_cli_error("Error hiding secret", e),
             }
         }
 
@@ -652,7 +657,7 @@ fn main() {
 
             if in_path.is_none() || out_path.is_none() {
                 eprintln!("Error: Both input and output files are required for convert command.");
-                return;
+                std::process::exit(1);
             }
 
             let input_p = in_path.unwrap();
@@ -667,21 +672,21 @@ fn main() {
                 embed.as_deref(),
             ) {
                 Ok(_) => println!("Converted '{}' to '{}'.", input_p.display(), output_p.display()),
-                Err(e) => eprintln!("Error converting file: {}", e),
+                Err(e) => handle_cli_error("Error converting file", e),
             }
         }
 
         Some(Commands::Validate { env, schema }) => {
             match env_file::validate_env_file(&schema, &env) {
                 Ok(_) => println!("Validation complete."),
-                Err(e) => eprintln!("Error validating env file: {}", e),
+                Err(e) => handle_cli_error("Error validating env file", e),
             }
         }
 
         Some(Commands::Generate { env, out }) => {
             match env_file::generate_template(&env, &out) {
                 Ok(_) => println!("Template file '{}' created successfully.", out.display()),
-                Err(e) => eprintln!("Error generating template: {}", e),
+                Err(e) => handle_cli_error("Error generating template", e),
             }
         }
 
@@ -689,7 +694,7 @@ fn main() {
             let pwd = get_password_or_prompt(password, "Enter encryption password: ");
             match env_file::encrypt_env_file(&file, out.as_deref(), pwd.as_deref()) {
                 Ok(target) => println!("Encrypted file saved to '{}'.", target.display()),
-                Err(e) => eprintln!("Error encrypting file: {}", e),
+                Err(e) => handle_cli_error("Error encrypting file", e),
             }
         }
 
@@ -697,7 +702,7 @@ fn main() {
             let pwd = get_password_or_prompt(password, "Enter decryption password: ");
             match env_file::decrypt_env_file(&file, out.as_deref(), pwd.as_deref()) {
                 Ok(target) => println!("Decrypted file saved to '{}'.", target.display()),
-                Err(e) => eprintln!("Error decrypting file: {}", e),
+                Err(e) => handle_cli_error("Error decrypting file", e),
             }
         }
 
@@ -710,16 +715,13 @@ fn main() {
             let pwd = get_password_or_prompt(password, "Enter wallet/env password (if encrypted): ");
             match env_file::run_with_envs(env.as_deref(), secret.as_deref(), &command, pwd.as_deref()) {
                 Ok(code) => std::process::exit(code),
-                Err(e) => {
-                    eprintln!("Error running command: {}", e);
-                    std::process::exit(1);
-                }
+                Err(e) => handle_cli_error("Error running command", e),
             }
         }
 
         Some(Commands::Log { env_name, file }) => {
             if let Err(e) = env_file::log_env_var(&env_name, &file) {
-                eprintln!("Error logging variable: {}", e);
+                handle_cli_error("Error logging variable", e);
             }
         }
 

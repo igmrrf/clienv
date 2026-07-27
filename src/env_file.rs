@@ -349,7 +349,7 @@ pub fn decrypt_env_file(input_file: &Path, output_file: Option<&Path>, password:
         None => PathBuf::from(clean_name),
     };
 
-    fs::write(&target_path, plain_str.as_bytes())?;
+    write_secure_file(&target_path, plain_str.as_bytes())?;
     Ok(target_path)
 }
 

@@ -119,12 +119,16 @@ pub fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
 pub fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
     let mut key = [0u8; 32];
     let argon2 = Argon2::default();
-    if argon2.hash_password_into(password.as_bytes(), salt, &mut key).is_err() {
+    let effective_salt = if salt.len() < 8 {
         let mut hasher = Sha256::new();
         hasher.update(salt);
-        hasher.update(password.as_bytes());
-        key = hasher.finalize().into();
-    }
+        hasher.finalize().to_vec()
+    } else {
+        salt.to_vec()
+    };
+    argon2
+        .hash_password_into(password.as_bytes(), &effective_salt, &mut key)
+        .expect("Argon2 key derivation failed");
     key
 }
 
