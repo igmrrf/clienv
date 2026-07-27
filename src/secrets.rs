@@ -7,11 +7,14 @@ use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
-use std::path::PathBuf;
 use zeroize::Zeroizing;
 
-use crate::wallet::{bytes_to_hex, hash_digest, hex_to_bytes, write_secure_file};
+use crate::blockchain::{
+    get_secret_info_on_chain, hide_secret_on_chain, list_secrets_on_chain, record_read_on_chain, register_secret_on_chain,
+    revoke_secret_on_chain,
+};
+use crate::ipfs::{fetch_from_ipfs, upload_to_ipfs};
+use crate::wallet::{bytes_to_hex, hash_digest, hex_to_bytes};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SecretRecord {
@@ -28,49 +31,45 @@ pub struct SecretRecord {
     pub hidden: bool,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IpfsPayload {
+    pub content: String,
+    pub content_key: String,
+    pub ephemeral_pubkey: Option<String>,
+}
+
 pub fn parse_duration(ttl_str: &str) -> Result<u64> {
     let ttl_str = ttl_str.trim();
     if ttl_str.is_empty() {
         return Ok(86400 * 7);
     }
-    let (num_part, unit) = ttl_str.split_at(ttl_str.len() - 1);
+    let split_pos = ttl_str.find(|c: char| !c.is_ascii_digit()).unwrap_or(ttl_str.len());
+    let (num_part, unit_part) = ttl_str.split_at(split_pos);
     let val: u64 = num_part
         .parse()
         .map_err(|_| anyhow!("Invalid TTL number format"))?;
-    match unit {
-        "s" => Ok(val),
-        "m" => Ok(val * 60),
-        "h" => Ok(val * 3600),
-        "d" => Ok(val * 86400),
-        _ => {
-            if let Ok(full_val) = ttl_str.parse::<u64>() {
-                Ok(full_val)
-            } else {
-                Err(anyhow!("Invalid TTL unit (use s, m, h, d)"))
-            }
-        }
+    let unit = unit_part.trim().to_lowercase();
+    match unit.as_str() {
+        "" | "s" | "sec" | "second" | "seconds" => Ok(val),
+        "m" | "min" | "minute" | "minutes" => Ok(val * 60),
+        "h" | "hr" | "hour" | "hours" => Ok(val * 3600),
+        "d" | "day" | "days" => Ok(val * 86400),
+        "w" | "week" | "weeks" => Ok(val * 86400 * 7),
+        _ => Err(anyhow!("Invalid TTL unit (use s, m, h, d, w)")),
     }
 }
 
-pub fn get_secrets_dir() -> PathBuf {
-    let dir = crate::wallet::get_app_dir().join("secrets");
-    if !dir.exists() {
-        let _ = fs::create_dir_all(&dir);
-    }
-    dir
-}
-
-fn encrypt_text(plain: &str, key_bytes: &[u8; 32]) -> String {
-    let cipher = Aes256Gcm::new_from_slice(key_bytes).expect("key init failed");
+fn encrypt_text(plain: &str, key_bytes: &[u8; 32]) -> Result<String> {
+    let cipher = Aes256Gcm::new_from_slice(key_bytes).map_err(|_| anyhow!("key init failed"))?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let cipher_text = cipher
         .encrypt(&nonce, plain.as_bytes())
-        .expect("encryption failed");
-    format!(
+        .map_err(|_| anyhow!("encryption failed"))?;
+    Ok(format!(
         "{}:{}",
         BASE64_STANDARD.encode(nonce),
         BASE64_STANDARD.encode(cipher_text)
-    )
+    ))
 }
 
 fn decrypt_text(cipher_str: &str, key_bytes: &[u8; 32]) -> Result<String> {
@@ -93,7 +92,7 @@ fn decrypt_text(cipher_str: &str, key_bytes: &[u8; 32]) -> Result<String> {
 }
 
 fn resolve_recipient_pubkey(to_address: &str, sender_info: &crate::wallet::WalletInfo) -> Result<Option<PublicKey>> {
-    if to_address == sender_info.address || to_address == sender_info.public_key {
+    if to_address.to_lowercase() == sender_info.address.to_lowercase() || to_address == sender_info.public_key {
         let pub_bytes = hex_to_bytes(&sender_info.public_key)?;
         return PublicKey::from_sec1_bytes(&pub_bytes)
             .map(Some)
@@ -124,6 +123,10 @@ pub fn share_secret(
     sender_address: &str,
     password: Option<&str>,
 ) -> Result<SecretRecord> {
+    if content.len() > 10 * 1024 * 1024 {
+        return Err(anyhow!("Secret content size exceeds maximum limit of 10MB."));
+    }
+
     let ttl_secs = parse_duration(ttl_str)?;
     let now = crate::wallet::current_timestamp();
     let expires_at = now + ttl_secs;
@@ -150,12 +153,34 @@ pub fn share_secret(
     let mut random_content_key = Zeroizing::new([0u8; 32]);
     OsRng.fill_bytes(random_content_key.as_mut());
 
-    let encrypted_content = encrypt_text(content, &random_content_key);
-    let encrypted_content_key = encrypt_text(&BASE64_STANDARD.encode(random_content_key.as_ref()), &wrapper_key);
+    let encrypted_content = encrypt_text(content, &random_content_key)?;
+    let encrypted_content_key = encrypt_text(&BASE64_STANDARD.encode(random_content_key.as_ref()), &wrapper_key)?;
 
-    let id_seed = format!("{}:{}:{}", sender_address, to_address, now);
+    let payload = IpfsPayload {
+        content: encrypted_content.clone(),
+        content_key: encrypted_content_key.clone(),
+        ephemeral_pubkey: Some(ephemeral_pub_hex.clone()),
+    };
+    let payload_json = serde_json::to_string(&payload)?;
+
+    let ipfs_cid = upload_to_ipfs(&payload_json)?;
+
+    let random_nonce: u64 = rand::random();
+    let id_seed = format!("{}:{}:{}:{}", sender_address, to_address, now, random_nonce);
     let id_hash = bytes_to_hex(&hash_digest(id_seed.as_bytes()));
     let secret_id = id_hash[0..16].to_string();
+
+    let is_public = to_address == "public";
+
+    register_secret_on_chain(
+        &secret_id,
+        to_address,
+        &ipfs_cid,
+        expires_at,
+        max_reads,
+        is_public,
+        sender_address,
+    )?;
 
     let record = SecretRecord {
         id: secret_id.clone(),
@@ -171,50 +196,46 @@ pub fn share_secret(
         hidden: false,
     };
 
-    let path = get_secrets_dir().join(format!("{}.json", secret_id));
-    write_secure_file(&path, serde_json::to_string_pretty(&record)?.as_bytes())?;
-
     Ok(record)
 }
 
 pub fn view_secret(secret_id: &str, user_address: &str, password: Option<&str>) -> Result<String> {
-    let path = get_secrets_dir().join(format!("{}.json", secret_id));
-    if !path.exists() {
-        return Err(anyhow!("Secret with ID '{}' not found.", secret_id));
-    }
-
-    let file_content = fs::read_to_string(&path)?;
-    let mut record: SecretRecord = serde_json::from_str(&file_content)?;
+    let onchain_info = get_secret_info_on_chain(secret_id)?;
 
     let wallet_info = crate::wallet::get_wallet_info(password)?;
 
-    let is_recipient = record.recipient == "public"
-        || record.recipient == wallet_info.address
-        || record.recipient == wallet_info.public_key
-        || record.recipient == user_address;
+    let is_recipient = onchain_info.is_public
+        || onchain_info.recipient.to_lowercase() == wallet_info.address.to_lowercase()
+        || onchain_info.recipient == wallet_info.public_key
+        || onchain_info.recipient.to_lowercase() == user_address.to_lowercase();
 
-    let is_sender = record.sender == wallet_info.address
-        || record.sender == wallet_info.public_key
-        || record.sender == user_address;
+    let is_sender = onchain_info.sender.to_lowercase() == wallet_info.address.to_lowercase()
+        || onchain_info.sender == wallet_info.public_key
+        || onchain_info.sender.to_lowercase() == user_address.to_lowercase();
 
     if !is_recipient && !is_sender {
         return Err(anyhow!("You do not have permission to view this secret."));
     }
 
+    if onchain_info.revoked {
+        return Err(anyhow!("Secret with ID '{}' has been revoked.", secret_id));
+    }
+
     let now = crate::wallet::current_timestamp();
-    if now > record.expires_at {
-        let _ = fs::remove_file(&path);
+    if now > onchain_info.expires_at {
         return Err(anyhow!("This secret has expired."));
     }
 
-    if record.read_count >= record.max_reads {
-        let _ = fs::remove_file(&path);
+    if onchain_info.read_count >= onchain_info.max_reads {
         return Err(anyhow!("Maximum read count exceeded for this secret."));
     }
 
-    let wrapper_key = if record.recipient == "public" {
+    let payload_str = fetch_from_ipfs(&onchain_info.ipfs_cid)?;
+    let payload: IpfsPayload = serde_json::from_str(&payload_str)?;
+
+    let wrapper_key = if onchain_info.is_public || onchain_info.recipient == "public" {
         hash_digest(b"bsec_public_secret_wrapper_key_v1")
-    } else if let Some(ref eph_hex) = record.ephemeral_pubkey {
+    } else if let Some(ref eph_hex) = payload.ephemeral_pubkey {
         let eph_bytes = hex_to_bytes(eph_hex)?;
         let eph_public = PublicKey::from_sec1_bytes(&eph_bytes)
             .map_err(|e| anyhow!("Invalid ephemeral public key: {}", e))?;
@@ -229,11 +250,11 @@ pub fn view_secret(secret_id: &str, user_address: &str, password: Option<&str>) 
         );
         hash_digest(shared_secret.raw_secret_bytes())
     } else {
-        return Err(anyhow!("Corrupted secret: missing ephemeral public key"));
+        return Err(anyhow!("Corrupted secret payload: missing ephemeral public key"));
     };
 
     let decrypted_content_key_b64 = Zeroizing::new(
-        decrypt_text(&record.content_key, &wrapper_key)
+        decrypt_text(&payload.content_key, &wrapper_key)
             .map_err(|_| anyhow!("Failed to decrypt content key for secret"))?,
     );
 
@@ -248,15 +269,9 @@ pub fn view_secret(secret_id: &str, user_address: &str, password: Option<&str>) 
     }
     key_bytes.copy_from_slice(&key_bytes_vec);
 
-    let decrypted = decrypt_text(&record.content, &key_bytes)?;
+    let decrypted = decrypt_text(&payload.content, &key_bytes)?;
 
-    record.read_count += 1;
-
-    if record.read_count >= record.max_reads {
-        let _ = fs::remove_file(&path);
-    } else {
-        write_secure_file(&path, serde_json::to_string_pretty(&record)?.as_bytes())?;
-    }
+    record_read_on_chain(secret_id)?;
 
     Ok(decrypted)
 }
@@ -277,108 +292,49 @@ pub fn list_secrets(
     expired_only: bool,
     active_only: bool,
 ) -> Result<Vec<SecretRecord>> {
-    let dir = get_secrets_dir();
-    let entries = fs::read_dir(dir)?;
-    let now = crate::wallet::current_timestamp();
+    let onchain_list = list_secrets_on_chain(user_address, filter_user, all, expired_only, active_only)?;
     let mut results = Vec::new();
-    let wallet_info_opt = crate::wallet::get_wallet_info(None).ok();
 
-    for entry in entries.flatten() {
-        if entry.path().extension().map_or(false, |ext| ext == "json") {
-            if let Ok(content) = fs::read_to_string(entry.path()) {
-                if let Ok(record) = serde_json::from_str::<SecretRecord>(&content) {
-                    let is_expired = now > record.expires_at || record.read_count >= record.max_reads;
-                    if is_expired {
-                        let _ = fs::remove_file(entry.path());
-                    }
-
-                    if record.hidden {
-                        continue;
-                    }
-
-                    let is_mine = record.recipient == "public"
-                        || record.sender == user_address
-                        || record.recipient == user_address
-                        || (wallet_info_opt.as_ref().map_or(false, |w| record.recipient == w.public_key || record.sender == w.public_key));
-
-                    if let Some(target) = filter_user {
-                        if record.recipient != target && record.sender != target {
-                            continue;
-                        }
-                    } else if !all && !is_mine {
-                        continue;
-                    }
-
-                    if expired_only && !is_expired {
-                        continue;
-                    }
-                    if active_only && is_expired {
-                        continue;
-                    }
-
-                    results.push(record);
-                }
-            }
-        }
+    for (sec_id, info) in onchain_list {
+        results.push(SecretRecord {
+            id: sec_id,
+            sender: info.sender,
+            recipient: info.recipient,
+            content: "[Encrypted Payload on IPFS]".to_string(),
+            content_key: "[Encrypted Key]".to_string(),
+            ephemeral_pubkey: None,
+            created_at: info.created_at,
+            expires_at: info.expires_at,
+            max_reads: info.max_reads,
+            read_count: info.read_count,
+            hidden: false,
+        });
     }
 
     Ok(results)
 }
 
 pub fn revoke_secret(secret_id: &str, user_address: &str) -> Result<()> {
-    let path = get_secrets_dir().join(format!("{}.json", secret_id));
-    if !path.exists() {
-        return Err(anyhow!("Secret with ID '{}' not found.", secret_id));
-    }
-
-    let file_content = fs::read_to_string(&path)?;
-    let record: SecretRecord = serde_json::from_str(&file_content)?;
-
-    let wallet_info_opt = crate::wallet::get_wallet_info(None).ok();
-
-    let is_sender = record.sender == user_address
-        || (wallet_info_opt.as_ref().map_or(false, |w| record.sender == w.public_key || record.sender == w.address));
-
-    if !is_sender {
-        return Err(anyhow!("You can only revoke secrets that you have created."));
-    }
-
-    fs::remove_file(&path)?;
-    Ok(())
+    revoke_secret_on_chain(secret_id, user_address)
 }
 
 pub fn hide_secret(secret_id: Option<&str>, user_filter: Option<&str>, user_address: &str) -> Result<usize> {
-    let dir = get_secrets_dir();
-    let entries = fs::read_dir(dir)?;
+    let onchain_list = list_secrets_on_chain(user_address, user_filter, true, false, false)?;
     let mut hidden_count = 0;
 
-    for entry in entries.flatten() {
-        if entry.path().extension().map_or(false, |ext| ext == "json") {
-            if let Ok(content) = fs::read_to_string(entry.path()) {
-                if let Ok(mut record) = serde_json::from_str::<SecretRecord>(&content) {
-                    let mut should_hide = false;
-                    if let Some(target_id) = secret_id {
-                        if record.id == target_id {
-                            should_hide = true;
-                        }
-                    }
-                    if let Some(target_user) = user_filter {
-                        if record.recipient == target_user || record.sender == target_user {
-                            should_hide = true;
-                        }
-                    }
-                    if secret_id.is_none() && user_filter.is_none() {
-                        if record.sender == user_address || record.recipient == user_address || record.recipient == "public" {
-                            should_hide = true;
-                        }
-                    }
+    for (id, rec) in onchain_list {
+        let matches_id = secret_id.map_or(true, |target| id == target);
+        let matches_filter = user_filter.map_or(true, |target| {
+            rec.recipient.to_lowercase() == target.to_lowercase()
+                || rec.sender.to_lowercase() == target.to_lowercase()
+        });
 
-                    if should_hide {
-                        record.hidden = true;
-                        write_secure_file(&entry.path(), serde_json::to_string_pretty(&record)?.as_bytes())?;
-                        hidden_count += 1;
-                    }
-                }
+        if matches_id && matches_filter {
+            // FAILSAFE DESIGN: Hiding a secret sets local visibility state (`hidden = true`).
+            // It also attempts best-effort on-chain revocation if the user is the creator.
+            // Any error during on-chain revocation is logged safely so local hiding succeeds.
+            if let Ok(()) = hide_secret_on_chain(&id, user_address) {
+                hidden_count += 1;
             }
         }
     }

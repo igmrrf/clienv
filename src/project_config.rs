@@ -16,13 +16,10 @@ pub fn get_project_config_path() -> PathBuf {
 
 pub fn load_project_config() -> Option<ProjectConfig> {
     let path = get_project_config_path();
-    if path.exists() {
-        if let Ok(content) = fs::read_to_string(&path) {
-            if let Ok(config) = serde_json::from_str::<ProjectConfig>(&content) {
-                return Some(config);
-            }
+    if let Ok(content) = fs::read_to_string(&path)
+        && let Ok(config) = serde_json::from_str::<ProjectConfig>(&content) {
+            return Some(config);
         }
-    }
     None
 }
 
@@ -30,6 +27,6 @@ pub fn load_project_config() -> Option<ProjectConfig> {
 pub fn save_project_config(config: &ProjectConfig) -> anyhow::Result<()> {
     let path = get_project_config_path();
     let content = serde_json::to_string_pretty(config)?;
-    fs::write(path, content)?;
+    crate::wallet::write_secure_file(&path, content.as_bytes())?;
     Ok(())
 }

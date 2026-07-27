@@ -99,3 +99,34 @@ fn test_invalid_password_exit_code_2() -> Result<(), Box<dyn std::error::Error>>
 
     Ok(())
 }
+
+/// Tests bsec wallet export subcommand and explicit info flags.
+/// Target File: `src/main.rs` -> `WalletCommands::Export`
+/// Flow: `bsec wallet export` -> verifies Private Key and Mnemonic are output
+#[test]
+fn test_wallet_export_command() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = assert_fs::TempDir::new()?;
+
+    let mut cmd_init = Command::cargo_bin("bsec")?;
+    cmd_init.current_dir(temp_dir.path());
+    cmd_init.env("BSEC_HOME", temp_dir.path());
+    cmd_init
+        .arg("init")
+        .arg("--overwrite");
+    cmd_init.assert().success();
+
+    let mut cmd_export = Command::cargo_bin("bsec")?;
+    cmd_export.current_dir(temp_dir.path());
+    cmd_export.env("BSEC_HOME", temp_dir.path());
+    cmd_export
+        .arg("wallet")
+        .arg("export");
+
+    cmd_export
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Private Key:"))
+        .stdout(predicate::str::contains("Mnemonic:"));
+
+    Ok(())
+}

@@ -14,15 +14,17 @@ pub struct NetworkConfig {
     pub network: String,
     pub chain_id: u32,
     pub rpc_url: String,
+    pub registry_address: String,
     pub ipfs: IpfsConfig,
 }
 
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            network: "polygon".to_string(),
-            chain_id: 137,
-            rpc_url: "https://polygon-rpc.com".to_string(),
+            network: "amoy".to_string(),
+            chain_id: 80002,
+            rpc_url: "https://rpc-amoy.polygon.technology".to_string(),
+            registry_address: "0x39a13aC4081076bEDdA4cCdC8b8E8d8f07F3bA49".to_string(),
             ipfs: IpfsConfig {
                 gateway: "https://ipfs.io/ipfs/".to_string(),
                 pinning_service: None,
@@ -37,20 +39,17 @@ pub fn get_config_path() -> PathBuf {
 
 pub fn load_network_config() -> NetworkConfig {
     let path = get_config_path();
-    if path.exists() {
-        if let Ok(content) = fs::read_to_string(path) {
-            if let Ok(config) = serde_json::from_str(&content) {
-                return config;
-            }
+    if let Ok(content) = fs::read_to_string(&path)
+        && let Ok(config) = serde_json::from_str(&content) {
+            return config;
         }
-    }
     NetworkConfig::default()
 }
 
 pub fn save_network_config(config: &NetworkConfig) -> Result<()> {
     let path = get_config_path();
     let content = serde_json::to_string_pretty(config)?;
-    fs::write(path, content)?;
+    crate::wallet::write_secure_file(&path, content.as_bytes())?;
     Ok(())
 }
 

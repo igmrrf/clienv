@@ -3,10 +3,12 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 mod bip39_words;
+mod blockchain;
 mod config;
 mod env_file;
 mod errors;
 mod helpers;
+mod ipfs;
 mod manager;
 mod network_config;
 mod project_config;
@@ -345,6 +347,29 @@ enum WalletCommands {
         /// Output in JSON format
         #[arg(long)]
         json: bool,
+
+        /// Include private key in output (use with caution)
+        #[arg(long)]
+        show_private_key: bool,
+
+        /// Include mnemonic phrase in output (use with caution)
+        #[arg(long)]
+        show_mnemonic: bool,
+    },
+
+    /// Export wallet private key or mnemonic phrase
+    Export {
+        /// Password if wallet is encrypted
+        #[arg(short, long)]
+        password: Option<String>,
+
+        /// Export private key only
+        #[arg(long)]
+        private_key: bool,
+
+        /// Export mnemonic phrase only
+        #[arg(long)]
+        mnemonic: bool,
     },
 }
 
@@ -420,14 +445,37 @@ fn main() {
         }
 
         Some(Commands::Wallet {
-            sub: WalletCommands::Info { password, json },
+            sub:
+                WalletCommands::Info {
+                    password,
+                    json,
+                    show_private_key,
+                    show_mnemonic,
+                },
         }) => {
             let pwd = get_password_or_prompt(password, "Enter wallet password (if encrypted): ");
             match wallet::get_wallet_info(pwd.as_deref()) {
                 Ok(info) => {
                     if json {
-                        if let Ok(j) = serde_json::to_string_pretty(&info) {
-                            println!("{}", j);
+                        if show_private_key || show_mnemonic {
+                            let mut map = serde_json::to_value(wallet::WalletInfoPublic::from(&info))
+                                .unwrap_or_default();
+                            if let Some(obj) = map.as_object_mut() {
+                                if show_private_key {
+                                    obj.insert("private_key".to_string(), serde_json::Value::String(info.private_key.clone()));
+                                }
+                                if show_mnemonic {
+                                    obj.insert("mnemonic".to_string(), serde_json::Value::String(info.mnemonic.clone()));
+                                }
+                            }
+                            if let Ok(j) = serde_json::to_string_pretty(&map) {
+                                println!("{}", j);
+                            }
+                        } else {
+                            let public_info = wallet::WalletInfoPublic::from(&info);
+                            if let Ok(j) = serde_json::to_string_pretty(&public_info) {
+                                println!("{}", j);
+                            }
                         }
                     } else {
                         println!("Wallet Information:");
@@ -439,9 +487,39 @@ fn main() {
                         }
                         println!("Created: {}", info.created_at);
                         println!("Last Accessed: {}", info.last_accessed);
+                        if show_private_key {
+                            println!("Private Key: {}", info.private_key);
+                        }
+                        if show_mnemonic {
+                            println!("Mnemonic: {}", info.mnemonic);
+                        }
                     }
                 }
                 Err(e) => handle_cli_error("Error getting wallet info", e),
+            }
+        }
+
+        Some(Commands::Wallet {
+            sub:
+                WalletCommands::Export {
+                    password,
+                    private_key,
+                    mnemonic,
+                },
+        }) => {
+            let pwd = get_password_or_prompt(password, "Enter wallet password (if encrypted): ");
+            match wallet::get_wallet_info(pwd.as_deref()) {
+                Ok(info) => {
+                    println!("SECURITY WARNING: Keep your private key and mnemonic secret!");
+                    println!("------------------------------------------------------------");
+                    if private_key || (!private_key && !mnemonic) {
+                        println!("Private Key: {}", info.private_key);
+                    }
+                    if mnemonic || (!private_key && !mnemonic) {
+                        println!("Mnemonic: {}", info.mnemonic);
+                    }
+                }
+                Err(e) => handle_cli_error("Error exporting wallet", e),
             }
         }
 

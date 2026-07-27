@@ -1,1 +1,9 @@
 /target
+.env
+.env.*
+!.env.schema
+!.env.template
+*.pass
+.bsec/
+wallet.json
+env_vars.json

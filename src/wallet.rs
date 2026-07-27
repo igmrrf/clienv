@@ -25,6 +25,27 @@ pub struct WalletInfo {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WalletInfoPublic {
+    pub address: String,
+    pub public_key: String,
+    pub created_at: u64,
+    pub last_accessed: u64,
+    pub user_id: Option<String>,
+}
+
+impl From<&WalletInfo> for WalletInfoPublic {
+    fn from(w: &WalletInfo) -> Self {
+        Self {
+            address: w.address.clone(),
+            public_key: w.public_key.clone(),
+            created_at: w.created_at,
+            last_accessed: w.last_accessed,
+            user_id: w.user_id.clone(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WalletConfig {
     pub address: String,
     pub created_at: u64,
@@ -107,7 +128,7 @@ pub fn bytes_to_hex(bytes: &[u8]) -> String {
 
 pub fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
     let hex = hex.trim_start_matches("0x");
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err(anyhow!("Invalid hex length"));
     }
     (0..hex.len())
@@ -116,7 +137,7 @@ pub fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-pub fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
+pub fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; 32]> {
     let mut key = [0u8; 32];
     let argon2 = Argon2::default();
     let effective_salt = if salt.len() < 8 {
@@ -128,8 +149,8 @@ pub fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
     };
     argon2
         .hash_password_into(password.as_bytes(), &effective_salt, &mut key)
-        .expect("Argon2 key derivation failed");
-    key
+        .map_err(|e| anyhow!("Argon2 key derivation failed: {}", e))?;
+    Ok(key)
 }
 
 pub fn derive_key_legacy(password: &str) -> [u8; 32] {
@@ -140,28 +161,28 @@ pub fn derive_key_legacy(password: &str) -> [u8; 32] {
     let mut key: [u8; 32] = hasher.finalize().into();
     for _ in 0..10_000 {
         let mut h = Sha256::new();
-        h.update(&key);
+        h.update(key);
         h.update(password.as_bytes());
         key = h.finalize().into();
     }
     key
 }
 
-pub fn encrypt_wallet(data_str: &str, password: &str) -> String {
+pub fn encrypt_wallet(data_str: &str, password: &str) -> Result<String> {
     let mut salt = [0u8; 16];
     OsRng.fill_bytes(&mut salt);
-    let key = derive_key(password, &salt);
-    let cipher = Aes256Gcm::new_from_slice(&key).expect("invalid key length");
+    let key = derive_key(password, &salt)?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| anyhow!("invalid cipher key length"))?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let cipher_text = cipher
         .encrypt(&nonce, data_str.as_bytes())
-        .expect("wallet encryption failed");
-    format!(
+        .map_err(|_| anyhow!("wallet encryption failed"))?;
+    Ok(format!(
         "{}:{}:{}",
         BASE64_STANDARD.encode(salt),
         BASE64_STANDARD.encode(nonce),
         BASE64_STANDARD.encode(cipher_text)
-    )
+    ))
 }
 
 pub fn decrypt_wallet(encrypted_str: &str, password: &str) -> Result<String> {
@@ -170,7 +191,7 @@ pub fn decrypt_wallet(encrypted_str: &str, password: &str) -> Result<String> {
         let salt = BASE64_STANDARD
             .decode(parts[0])
             .map_err(|_| anyhow!("Invalid salt base64"))?;
-        let key = derive_key(password, &salt);
+        let key = derive_key(password, &salt)?;
         let cipher = Aes256Gcm::new_from_slice(&key)
             .map_err(|_| anyhow!("invalid cipher key"))?;
         let decoded_nonce = BASE64_STANDARD
@@ -206,11 +227,11 @@ pub fn decrypt_wallet(encrypted_str: &str, password: &str) -> Result<String> {
     }
 }
 
-pub fn generate_mnemonic() -> String {
+pub fn generate_mnemonic() -> Result<String> {
     let mut entropy = [0u8; 16];
     OsRng.fill_bytes(&mut entropy);
-    let mnemonic = bip39::Mnemonic::from_entropy(&entropy).expect("mnemonic generation failed");
-    mnemonic.to_string()
+    let mnemonic = bip39::Mnemonic::from_entropy(&entropy).map_err(|e| anyhow!("mnemonic generation failed: {}", e))?;
+    Ok(mnemonic.to_string())
 }
 
 pub fn init_wallet(
@@ -235,15 +256,32 @@ pub fn init_wallet(
                 .map_err(|e| anyhow!("Invalid BIP-39 mnemonic phrase: {}", e))?;
             m
         }
-        None => generate_mnemonic(),
+        None => generate_mnemonic()?,
     };
 
     let parsed_mnemonic = bip39::Mnemonic::parse(&mnemonic_str)
         .map_err(|e| anyhow!("Failed to parse mnemonic: {}", e))?;
     let seed = parsed_mnemonic.to_seed("");
 
-    let secret_key = k256::SecretKey::from_slice(&seed[0..32])
-        .map_err(|e| anyhow!("Failed to derive Secp256k1 secret key: {}", e))?;
+    let derivation_path = "m/44'/60'/0'/0/0";
+    let secret_key = if let Ok(path) = derivation_path.parse::<bip32::DerivationPath>() {
+        if let Ok(xprv) = bip32::XPrv::derive_from_path(seed, &path) {
+            k256::SecretKey::from_slice(&xprv.private_key().to_bytes())
+                .map_err(|e| anyhow!("Failed to derive Secp256k1 key: {}", e))?
+        } else {
+            // FAILSAFE DESIGN: If BIP-32 HD path derivation fails, fall back to using the raw 32-byte seed slice
+            // as a failsafe so wallet initialization never leaves the user stranded.
+            log::warn!("BIP-32 HD derivation failed for path {}; falling back to raw seed slice.", derivation_path);
+            k256::SecretKey::from_slice(&seed[0..32])
+                .map_err(|e| anyhow!("Failed to derive Secp256k1 secret key: {}", e))?
+        }
+    } else {
+        // FAILSAFE DESIGN: Fallback for invalid derivation path syntax.
+        log::warn!("Derivation path parse error; falling back to raw seed slice.");
+        k256::SecretKey::from_slice(&seed[0..32])
+            .map_err(|e| anyhow!("Failed to derive Secp256k1 secret key: {}", e))?
+    };
+
     let public_key = secret_key.public_key();
 
     let priv_bytes = secret_key.to_bytes();
@@ -253,8 +291,10 @@ pub fn init_wallet(
     let public_key_str = format!("0x{}", bytes_to_hex(pub_bytes.as_bytes()));
 
     let uncompressed_pub = &pub_bytes.as_bytes()[1..];
-    let pub_hash = hash_digest(uncompressed_pub);
-    let address = format!("0x{}", bytes_to_hex(&pub_hash[12..32]));
+    let pub_hash = crate::blockchain::keccak256(uncompressed_pub);
+    let mut addr_bytes = [0u8; 20];
+    addr_bytes.copy_from_slice(&pub_hash[12..32]);
+    let address = crate::blockchain::bytes_to_checksum_address(&addr_bytes);
     let now = current_timestamp();
 
     let wallet_info = WalletInfo {
@@ -270,7 +310,7 @@ pub fn init_wallet(
     let raw_data = serde_json::to_string(&wallet_info)?;
 
     let wallet_file = if let Some(ref pwd) = password {
-        let encrypted_data = encrypt_wallet(&raw_data, pwd);
+        let encrypted_data = encrypt_wallet(&raw_data, pwd)?;
         WalletFile {
             encrypted: true,
             data: encrypted_data,
@@ -305,17 +345,30 @@ pub fn get_wallet_info(password: Option<&str>) -> Result<WalletInfo> {
     }
 
     let content = fs::read_to_string(&wallet_path)?;
-    let wallet_file: WalletFile = serde_json::from_str(&content)?;
+    let mut wallet_file: WalletFile = serde_json::from_str(&content)?;
 
-    if wallet_file.encrypted {
+    let mut info = if wallet_file.encrypted {
         let pwd = password.ok_or_else(|| anyhow!("Wallet is encrypted. Password is required."))?;
         let decrypted_json = Zeroizing::new(decrypt_wallet(&wallet_file.data, pwd)?);
-        let mut info: WalletInfo = serde_json::from_str(&decrypted_json)?;
-        info.last_accessed = current_timestamp();
-        Ok(info)
+        serde_json::from_str::<WalletInfo>(&decrypted_json)?
     } else {
-        let mut info: WalletInfo = serde_json::from_str(&wallet_file.data)?;
-        info.last_accessed = current_timestamp();
-        Ok(info)
+        serde_json::from_str::<WalletInfo>(&wallet_file.data)?
+    };
+
+    let now = current_timestamp();
+    info.last_accessed = now;
+    wallet_file.last_accessed = now;
+    // FAILSAFE DESIGN: For unencrypted wallets, update inner payload JSON string. For encrypted wallets,
+    // re-encrypting inner payload on every read would require re-prompting for password or caching plaintext key.
+    // Updating outer `last_accessed` metadata allows access tracking without security risks or password re-prompt.
+    if !wallet_file.encrypted {
+        if let Ok(json_str) = serde_json::to_string(&info) {
+            wallet_file.data = json_str;
+        }
     }
+    if let Err(e) = write_secure_file(&wallet_path, serde_json::to_string_pretty(&wallet_file)?.as_bytes()) {
+        log::warn!("Failed to update wallet last_accessed timestamp on disk: {}", e);
+    }
+
+    Ok(info)
 }

@@ -18,7 +18,8 @@ pub fn parse_env_content(content: &str) -> BTreeMap<String, String> {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        if let Some((key, val)) = trimmed.split_once('=') {
+        let clean_line = trimmed.strip_prefix("export ").unwrap_or(trimmed).trim();
+        if let Some((key, val)) = clean_line.split_once('=') {
             let key = key.trim().to_string();
             let mut val_str = val.trim();
             let is_single_quoted = val_str.starts_with('\'') && val_str.ends_with('\'') && val_str.len() >= 2;
@@ -29,12 +30,19 @@ pub fn parse_env_content(content: &str) -> BTreeMap<String, String> {
                 inner.replace("\\'", "'")
             } else if is_double_quoted {
                 let inner = &val_str[1..val_str.len() - 1];
-                inner.replace("\\\"", "\"")
+                inner
+                    .replace("\\n", "\n")
+                    .replace("\\t", "\t")
+                    .replace("\\r", "\r")
+                    .replace("\\\"", "\"")
+                    .replace("\\\\", "\\")
             } else {
                 if let Some(pos) = val_str.find(" #") {
                     val_str = val_str[..pos].trim();
                 } else if let Some(pos) = val_str.find('#') {
-                    if pos > 0 && val_str.as_bytes()[pos - 1].is_ascii_whitespace() {
+                    if pos == 0 {
+                        val_str = "";
+                    } else if val_str.as_bytes()[pos - 1].is_ascii_whitespace() {
                         val_str = val_str[..pos].trim();
                     }
                 }
@@ -108,13 +116,11 @@ pub fn convert_env_file(
         map = new_map;
     }
 
-    let s = suffix.unwrap_or("");
-
     let output_str = if let Some(embed_prefix) = embed {
         let mut lines = Vec::new();
         lines.push("{".to_string());
-        for (k, _) in &map {
-            lines.push(format!("  {}: '{}{}{}',", k, embed_prefix, k, s));
+        for k in map.keys() {
+            lines.push(format!("  {}: '{}{}',", k, embed_prefix, k));
         }
         lines.push("}".to_string());
         lines.join("\n")
@@ -127,7 +133,7 @@ pub fn convert_env_file(
                 }
                 serde_json::to_string_pretty(&json_obj)?
             }
-            "yaml" | "yml" => serde_yaml::to_string(&map)?,
+            "yaml" | "yml" => yaml_serde::to_string(&map)?,
             _ => {
                 let mut lines = Vec::new();
                 for (k, v) in map {
@@ -153,7 +159,7 @@ pub fn validate_env_file(schema_path: &Path, env_path: &Path) -> Result<()> {
     if !env_path.exists() {
         println!("Environment file '{}' does not exist. Creating from schema...", env_path.display());
         let mut lines = Vec::new();
-        for (k, _) in &schema_map {
+        for k in schema_map.keys() {
             lines.push(format!("{}=", k));
         }
         fs::write(env_path, lines.join("\n"))?;
@@ -165,7 +171,7 @@ pub fn validate_env_file(schema_path: &Path, env_path: &Path) -> Result<()> {
     let env_map = parse_env_content(&env_content);
 
     let mut missing_keys = Vec::new();
-    for (k, _) in &schema_map {
+    for k in schema_map.keys() {
         if !env_map.contains_key(k) {
             missing_keys.push(k);
         }
@@ -235,11 +241,10 @@ fn derive_pass_key(pass: &str) -> [u8; 32] {
 }
 
 pub fn get_encryption_password(env_file_name: &str, provided_pwd: Option<&str>) -> Result<String> {
-    if let Some(p) = provided_pwd {
-        if !p.is_empty() {
+    if let Some(p) = provided_pwd
+        && !p.is_empty() {
             return Ok(p.to_string());
         }
-    }
 
     let file_stem = Path::new(env_file_name)
         .file_name()
@@ -266,17 +271,15 @@ pub fn get_encryption_password(env_file_name: &str, provided_pwd: Option<&str>) 
     }
 
     let pass_file = format!("{}.pass", file_stem);
-    if Path::new(&pass_file).exists() {
-        if let Ok(val) = fs::read_to_string(&pass_file) {
+    if Path::new(&pass_file).exists()
+        && let Ok(val) = fs::read_to_string(&pass_file) {
             return Ok(val.trim().to_string());
         }
-    }
 
-    if Path::new(".env.pass").exists() {
-        if let Ok(val) = fs::read_to_string(".env.pass") {
+    if Path::new(".env.pass").exists()
+        && let Ok(val) = fs::read_to_string(".env.pass") {
             return Ok(val.trim().to_string());
         }
-    }
 
     Err(anyhow!(
         "No encryption password found. Provide --password argument or set $DOTENV_PASS environment variable."
@@ -290,7 +293,7 @@ pub fn encrypt_env_file(input_file: &Path, output_file: Option<&Path>, password:
 
     let mut salt = [0u8; 16];
     aes_gcm::aead::rand_core::RngCore::fill_bytes(&mut aes_gcm::aead::OsRng, &mut salt);
-    let key = Zeroizing::new(crate::wallet::derive_key(&pwd, &salt));
+    let key = Zeroizing::new(crate::wallet::derive_key(&pwd, &salt)?);
 
     let cipher = Aes256Gcm::new_from_slice(key.as_ref()).map_err(|_| anyhow!("key init failed"))?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
@@ -323,7 +326,7 @@ pub fn decrypt_env_file(input_file: &Path, output_file: Option<&Path>, password:
     let parts: Vec<&str> = payload.trim().split(':').collect();
     let (key, nonce_b64, cipher_b64) = if parts.len() == 3 {
         let salt = BASE64_STANDARD.decode(parts[0]).map_err(|_| anyhow!("Invalid salt"))?;
-        let key = Zeroizing::new(crate::wallet::derive_key(&pwd, &salt));
+        let key = Zeroizing::new(crate::wallet::derive_key(&pwd, &salt)?);
         (key, parts[1], parts[2])
     } else if parts.len() == 2 {
         let key = Zeroizing::new(derive_pass_key(&pwd));
@@ -363,7 +366,7 @@ pub fn load_and_parse_env(env_path: &Path, password: Option<&str>) -> Result<BTr
         let parts: Vec<&str> = payload.trim().split(':').collect();
         let (key, nonce_b64, cipher_b64) = if parts.len() == 3 {
             let salt = BASE64_STANDARD.decode(parts[0]).map_err(|_| anyhow!("Invalid salt"))?;
-            let key = crate::wallet::derive_key(&pwd, &salt);
+            let key = crate::wallet::derive_key(&pwd, &salt)?;
             (key, parts[1], parts[2])
         } else if parts.len() == 2 {
             let key = derive_pass_key(&pwd);

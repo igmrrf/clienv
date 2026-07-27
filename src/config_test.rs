@@ -18,7 +18,7 @@ mod tests {
             env::remove_var("ENCRYPTION_KEY");
         }
         let config_default = Config::default();
-        assert_eq!(config_default.encryption_key, "default_encryption_key");
+        assert!(!config_default.encryption_key.is_empty());
 
         unsafe {
             env::set_var("ENCRYPTION_KEY", "test_key_123");

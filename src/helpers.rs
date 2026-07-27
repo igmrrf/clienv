@@ -27,7 +27,7 @@ pub fn log() -> Result<(), Box<dyn Error>> {
 
 pub fn search_file(path: &PathBuf, pattern: &str) {
     match std::fs::read_to_string(path)
-        .with_context(|| format!("could not read file `{}`", &path.display()))
+        .with_context(|| format!("could not read file `{}`", path.display()))
     {
         Ok(content) => find_matches(&content, pattern, &mut std::io::stdout()),
         Err(e) => {
@@ -36,3 +36,7 @@ pub fn search_file(path: &PathBuf, pattern: &str) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "helpers_test.rs"]
+mod helpers_test;
