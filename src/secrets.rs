@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use zeroize::Zeroizing;
 
 use crate::wallet::{bytes_to_hex, hash_digest, hex_to_bytes, write_secure_file};
 
@@ -146,11 +147,11 @@ pub fn share_secret(
         return Err(anyhow!("Cannot resolve recipient public key for encryption."));
     };
 
-    let mut random_content_key = [0u8; 32];
-    OsRng.fill_bytes(&mut random_content_key);
+    let mut random_content_key = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(random_content_key.as_mut());
 
     let encrypted_content = encrypt_text(content, &random_content_key);
-    let encrypted_content_key = encrypt_text(&BASE64_STANDARD.encode(&random_content_key), &wrapper_key);
+    let encrypted_content_key = encrypt_text(&BASE64_STANDARD.encode(random_content_key.as_ref()), &wrapper_key);
 
     let id_seed = format!("{}:{}:{}", sender_address, to_address, now);
     let id_hash = bytes_to_hex(&hash_digest(id_seed.as_bytes()));
@@ -218,7 +219,7 @@ pub fn view_secret(secret_id: &str, user_address: &str, password: Option<&str>) 
         let eph_public = PublicKey::from_sec1_bytes(&eph_bytes)
             .map_err(|e| anyhow!("Invalid ephemeral public key: {}", e))?;
 
-        let priv_bytes = hex_to_bytes(&wallet_info.private_key)?;
+        let priv_bytes = Zeroizing::new(hex_to_bytes(&wallet_info.private_key)?);
         let secret_key = SecretKey::from_slice(&priv_bytes)
             .map_err(|e| anyhow!("Invalid wallet private key: {}", e))?;
 
@@ -231,13 +232,17 @@ pub fn view_secret(secret_id: &str, user_address: &str, password: Option<&str>) 
         return Err(anyhow!("Corrupted secret: missing ephemeral public key"));
     };
 
-    let decrypted_content_key_b64 = decrypt_text(&record.content_key, &wrapper_key)
-        .map_err(|_| anyhow!("Failed to decrypt content key for secret"))?;
+    let decrypted_content_key_b64 = Zeroizing::new(
+        decrypt_text(&record.content_key, &wrapper_key)
+            .map_err(|_| anyhow!("Failed to decrypt content key for secret"))?,
+    );
 
-    let key_bytes_vec = BASE64_STANDARD
-        .decode(&decrypted_content_key_b64)
-        .map_err(|_| anyhow!("Failed to decode content key"))?;
-    let mut key_bytes = [0u8; 32];
+    let key_bytes_vec = Zeroizing::new(
+        BASE64_STANDARD
+            .decode(decrypted_content_key_b64.as_str())
+            .map_err(|_| anyhow!("Failed to decode content key"))?,
+    );
+    let mut key_bytes = Zeroizing::new([0u8; 32]);
     if key_bytes_vec.len() != 32 {
         return Err(anyhow!("Invalid content key length"));
     }

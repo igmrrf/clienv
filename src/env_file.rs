@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use zeroize::Zeroizing;
 
 use crate::wallet::{derive_key_legacy, write_secure_file};
 
@@ -283,15 +284,15 @@ pub fn get_encryption_password(env_file_name: &str, provided_pwd: Option<&str>) 
 }
 
 pub fn encrypt_env_file(input_file: &Path, output_file: Option<&Path>, password: Option<&str>) -> Result<PathBuf> {
-    let content = fs::read_to_string(input_file)?;
+    let content = Zeroizing::new(fs::read_to_string(input_file)?);
     let file_name = input_file.to_string_lossy().to_string();
-    let pwd = get_encryption_password(&file_name, password)?;
+    let pwd = Zeroizing::new(get_encryption_password(&file_name, password)?);
 
     let mut salt = [0u8; 16];
     aes_gcm::aead::rand_core::RngCore::fill_bytes(&mut aes_gcm::aead::OsRng, &mut salt);
-    let key = crate::wallet::derive_key(&pwd, &salt);
+    let key = Zeroizing::new(crate::wallet::derive_key(&pwd, &salt));
 
-    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| anyhow!("key init failed"))?;
+    let cipher = Aes256Gcm::new_from_slice(key.as_ref()).map_err(|_| anyhow!("key init failed"))?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let cipher_text = cipher
         .encrypt(&nonce, content.as_bytes())
@@ -317,36 +318,38 @@ pub fn decrypt_env_file(input_file: &Path, output_file: Option<&Path>, password:
     let payload = fs::read_to_string(input_file)?;
     let file_name = input_file.to_string_lossy().to_string();
     let clean_name = file_name.trim_end_matches(".enc").trim_end_matches(".encrypted");
-    let pwd = get_encryption_password(clean_name, password)?;
+    let pwd = Zeroizing::new(get_encryption_password(clean_name, password)?);
 
     let parts: Vec<&str> = payload.trim().split(':').collect();
     let (key, nonce_b64, cipher_b64) = if parts.len() == 3 {
         let salt = BASE64_STANDARD.decode(parts[0]).map_err(|_| anyhow!("Invalid salt"))?;
-        let key = crate::wallet::derive_key(&pwd, &salt);
+        let key = Zeroizing::new(crate::wallet::derive_key(&pwd, &salt));
         (key, parts[1], parts[2])
     } else if parts.len() == 2 {
-        let key = derive_pass_key(&pwd);
+        let key = Zeroizing::new(derive_pass_key(&pwd));
         (key, parts[0], parts[1])
     } else {
         return Err(anyhow!("Invalid encrypted payload format"));
     };
 
-    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| anyhow!("key init failed"))?;
+    let cipher = Aes256Gcm::new_from_slice(key.as_ref()).map_err(|_| anyhow!("key init failed"))?;
     let nonce_bytes = BASE64_STANDARD.decode(nonce_b64).map_err(|_| anyhow!("Invalid nonce"))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
     let cipher_bytes = BASE64_STANDARD.decode(cipher_b64).map_err(|_| anyhow!("Invalid cipher text"))?;
 
-    let plain_bytes = cipher
-        .decrypt(nonce, cipher_bytes.as_ref())
-        .map_err(|_| anyhow!("Decryption failed. Check your password."))?;
-    let plain_str = String::from_utf8(plain_bytes)?;
+    let plain_bytes = Zeroizing::new(
+        cipher
+            .decrypt(nonce, cipher_bytes.as_ref())
+            .map_err(|_| anyhow!("Decryption failed. Check your password."))?,
+    );
+    let plain_str = Zeroizing::new(String::from_utf8(plain_bytes.to_vec())?);
 
     let target_path = match output_file {
         Some(p) => p.to_path_buf(),
         None => PathBuf::from(clean_name),
     };
 
-    fs::write(&target_path, plain_str)?;
+    fs::write(&target_path, plain_str.as_bytes())?;
     Ok(target_path)
 }
 

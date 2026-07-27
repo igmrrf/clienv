@@ -1,10 +1,11 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
 mod bip39_words;
 mod config;
 mod env_file;
+mod errors;
 mod helpers;
 mod manager;
 mod network_config;
@@ -76,6 +77,17 @@ enum Commands {
         /// Show current configuration
         #[arg(long)]
         show: bool,
+
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Generate shell auto-completion script (bash, zsh, fish, powershell, elvish)
+    Completion {
+        /// Target shell
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
 
     /// Share a secret securely
@@ -120,6 +132,10 @@ enum Commands {
         /// Password to unlock wallet if required
         #[arg(short, long)]
         password: Option<String>,
+
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
     },
 
     /// List active or expired secrets
@@ -147,6 +163,10 @@ enum Commands {
         /// Password to unlock wallet if required
         #[arg(short, long)]
         password: Option<String>,
+
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
     },
 
     /// Revoke access to a shared secret
@@ -321,6 +341,10 @@ enum WalletCommands {
         /// Password if wallet is encrypted
         #[arg(short, long)]
         password: Option<String>,
+
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -368,21 +392,32 @@ fn main() {
             }
         }
 
+        Some(Commands::Completion { shell }) => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "bsec", &mut std::io::stdout());
+        }
+
         Some(Commands::Wallet {
-            sub: WalletCommands::Info { password },
+            sub: WalletCommands::Info { password, json },
         }) => {
             let pwd = get_password_or_prompt(password, "Enter wallet password (if encrypted): ");
             match wallet::get_wallet_info(pwd.as_deref()) {
                 Ok(info) => {
-                    println!("Wallet Information:");
-                    println!("-------------------");
-                    println!("Address: {}", info.address);
-                    println!("Public Key: {}", info.public_key);
-                    if let Some(ref uid) = info.user_id {
-                        println!("User ID: {}", uid);
+                    if json {
+                        if let Ok(j) = serde_json::to_string_pretty(&info) {
+                            println!("{}", j);
+                        }
+                    } else {
+                        println!("Wallet Information:");
+                        println!("-------------------");
+                        println!("Address: {}", info.address);
+                        println!("Public Key: {}", info.public_key);
+                        if let Some(ref uid) = info.user_id {
+                            println!("User ID: {}", uid);
+                        }
+                        println!("Created: {}", info.created_at);
+                        println!("Last Accessed: {}", info.last_accessed);
                     }
-                    println!("Created: {}", info.created_at);
-                    println!("Last Accessed: {}", info.last_accessed);
                 }
                 Err(e) => eprintln!("Error getting wallet info: {}", e),
             }
@@ -394,22 +429,37 @@ fn main() {
             ipfs_gateway,
             ipfs_pinning,
             show,
+            json,
         }) => {
             if show {
                 let conf = network_config::load_network_config();
-                println!("Current Configuration:");
-                println!("-------------------");
-                println!("Network: {}", conf.network);
-                println!("Chain ID: {}", conf.chain_id);
-                println!("RPC URL: {}", conf.rpc_url);
-                println!("IPFS Gateway: {}", conf.ipfs.gateway);
-                println!(
-                    "IPFS Pinning Service: {}",
-                    conf.ipfs.pinning_service.as_deref().unwrap_or("None")
-                );
+                if json {
+                    if let Ok(j) = serde_json::to_string_pretty(&conf) {
+                        println!("{}", j);
+                    }
+                } else {
+                    println!("Current Configuration:");
+                    println!("-------------------");
+                    println!("Network: {}", conf.network);
+                    println!("Chain ID: {}", conf.chain_id);
+                    println!("RPC URL: {}", conf.rpc_url);
+                    println!("IPFS Gateway: {}", conf.ipfs.gateway);
+                    println!(
+                        "IPFS Pinning Service: {}",
+                        conf.ipfs.pinning_service.as_deref().unwrap_or("None")
+                    );
+                }
             } else {
                 match network_config::update_network_config(network, rpc, ipfs_gateway, ipfs_pinning) {
-                    Ok(conf) => println!("Configuration updated: Network = {}", conf.network),
+                    Ok(conf) => {
+                        if json {
+                            if let Ok(j) = serde_json::to_string_pretty(&conf) {
+                                println!("{}", j);
+                            }
+                        } else {
+                            println!("Configuration updated: Network = {}", conf.network);
+                        }
+                    }
                     Err(e) => eprintln!("Error updating config: {}", e),
                 }
             }
@@ -467,6 +517,7 @@ fn main() {
             secret_id,
             output,
             password,
+            json,
         }) => {
             let pwd = get_password_or_prompt(password, "Enter wallet password (if encrypted): ");
             let user_addr = match wallet::get_wallet_info(pwd.as_deref()) {
@@ -479,7 +530,14 @@ fn main() {
 
             match secrets::view_secret(&secret_id, &user_addr, pwd.as_deref()) {
                 Ok(content) => {
-                    if let Some(out_path) = output {
+                    if json {
+                        let mut map = std::collections::BTreeMap::new();
+                        map.insert("secret_id", secret_id.clone());
+                        map.insert("content", content);
+                        if let Ok(j) = serde_json::to_string_pretty(&map) {
+                            println!("{}", j);
+                        }
+                    } else if let Some(out_path) = output {
                         if let Err(e) = std::fs::write(&out_path, &content) {
                             eprintln!("Error writing output file: {}", e);
                         } else {
@@ -503,6 +561,7 @@ fn main() {
             expired,
             active,
             password,
+            json,
         }) => {
             let pwd = get_password_or_prompt(password, "Enter wallet password (if encrypted): ");
             let user_addr = match wallet::get_wallet_info(pwd.as_deref()) {
@@ -516,7 +575,11 @@ fn main() {
             let list_all = all || all_users;
             match secrets::list_secrets(&user_addr, user.as_deref(), list_all, expired, active) {
                 Ok(list) => {
-                    if list.is_empty() {
+                    if json {
+                        if let Ok(j) = serde_json::to_string_pretty(&list) {
+                            println!("{}", j);
+                        }
+                    } else if list.is_empty() {
                         println!("No matching secrets found.");
                     } else {
                         println!("Secrets:");

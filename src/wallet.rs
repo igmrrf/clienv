@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Zeroize)]
 #[zeroize(drop)]
@@ -179,7 +179,8 @@ pub fn decrypt_wallet(encrypted_str: &str, password: &str) -> Result<String> {
         let plaintext = cipher
             .decrypt(nonce, cipher_text.as_ref())
             .map_err(|_| anyhow!("Invalid password or corrupted wallet data"))?;
-        String::from_utf8(plaintext).map_err(|e| anyhow!("UTF8 decode error: {}", e))
+        let text_str = String::from_utf8(plaintext).map_err(|e| anyhow!("UTF8 decode error: {}", e))?;
+        Ok(text_str)
     } else if parts.len() == 2 {
         let key = derive_key_legacy(password);
         let cipher = Aes256Gcm::new_from_slice(&key)
@@ -194,7 +195,8 @@ pub fn decrypt_wallet(encrypted_str: &str, password: &str) -> Result<String> {
         let plaintext = cipher
             .decrypt(nonce, cipher_text.as_ref())
             .map_err(|_| anyhow!("Invalid password or corrupted wallet data"))?;
-        String::from_utf8(plaintext).map_err(|e| anyhow!("UTF8 decode error: {}", e))
+        let text_str = String::from_utf8(plaintext).map_err(|e| anyhow!("UTF8 decode error: {}", e))?;
+        Ok(text_str)
     } else {
         Err(anyhow!("Invalid encrypted wallet format"))
     }
@@ -303,7 +305,7 @@ pub fn get_wallet_info(password: Option<&str>) -> Result<WalletInfo> {
 
     if wallet_file.encrypted {
         let pwd = password.ok_or_else(|| anyhow!("Wallet is encrypted. Password is required."))?;
-        let decrypted_json = decrypt_wallet(&wallet_file.data, pwd)?;
+        let decrypted_json = Zeroizing::new(decrypt_wallet(&wallet_file.data, pwd)?);
         let mut info: WalletInfo = serde_json::from_str(&decrypted_json)?;
         info.last_accessed = current_timestamp();
         Ok(info)
