@@ -9,6 +9,7 @@ mod errors;
 mod eth;
 mod helpers;
 mod ipfs;
+mod materialize;
 mod network_config;
 mod project_config;
 mod secrets;
