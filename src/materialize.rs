@@ -280,6 +280,105 @@ pub fn materialize_bundle(payload: &IpfsPayload, dir: &Path, force: bool) -> Res
     Ok(written)
 }
 
+/// Infer a SecretKind from a path's extension (spec §6.2). Unknown => Cred.
+pub fn infer_kind(path: &Path) -> SecretKind {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    // `.env`, `.env.prod`, etc. have file_name starting with ".env" but Path::extension
+    // treats ".env" as having no extension, so check the name too.
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name == ".env" || name.starts_with(".env.") || ext == "env" {
+        return SecretKind::Env;
+    }
+    match ext.as_str() {
+        "pem" | "crt" | "key" => SecretKind::Pem,
+        "json" => SecretKind::Json,
+        _ => SecretKind::Cred,
+    }
+}
+
+/// Read a file into a (body, encoding) pair. UTF-8 files are stored verbatim ("utf8");
+/// binary files are base64-encoded ("base64").
+pub fn read_file_body(path: &Path) -> Result<(String, String)> {
+    let bytes = std::fs::read(path).map_err(|e| anyhow!("reading {}: {}", path.display(), e))?;
+    match String::from_utf8(bytes) {
+        Ok(s) => Ok((s, "utf8".to_string())),
+        Err(e) => {
+            use base64::prelude::*;
+            Ok((BASE64_STANDARD.encode(e.as_bytes()), "base64".to_string()))
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ManifestMember {
+    path: String,
+    #[serde(rename = "as")]
+    as_kind: Option<String>,
+    filename: Option<String>,
+    env: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct BundleManifest {
+    members: Vec<ManifestMember>,
+}
+
+/// Parse a kind string (env|pem|json|cred) into a SecretKind.
+pub fn parse_kind(s: &str) -> Result<SecretKind> {
+    match s.to_lowercase().as_str() {
+        "env" => Ok(SecretKind::Env),
+        "pem" => Ok(SecretKind::Pem),
+        "json" => Ok(SecretKind::Json),
+        "cred" => Ok(SecretKind::Cred),
+        other => Err(anyhow!("unknown kind {:?} (use env|pem|json|cred)", other)),
+    }
+}
+
+/// Load a bundle manifest and read each listed file into a (plaintext) BundleMember.
+/// Filenames are sanitized to plain basenames. Paths are resolved relative to the manifest's
+/// own directory so a manifest is portable.
+pub fn load_bundle_members(manifest_path: &Path) -> Result<Vec<BundleMember>> {
+    let text = std::fs::read_to_string(manifest_path)
+        .map_err(|e| anyhow!("reading manifest {}: {}", manifest_path.display(), e))?;
+    let manifest: BundleManifest =
+        serde_json::from_str(&text).map_err(|e| anyhow!("invalid bundle manifest: {}", e))?;
+    if manifest.members.is_empty() {
+        return Err(anyhow!("bundle manifest has no members"));
+    }
+    let base = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+
+    let mut members = Vec::with_capacity(manifest.members.len());
+    for m in manifest.members {
+        let raw_path = Path::new(&m.path);
+        let file_path = if raw_path.is_absolute() {
+            raw_path.to_path_buf()
+        } else {
+            base.join(raw_path)
+        };
+        let kind = match m.as_kind {
+            Some(ref k) => parse_kind(k)?,
+            None => infer_kind(&file_path),
+        };
+        let filename = match m.filename {
+            Some(f) => sanitize_basename(&f)?,
+            None => {
+                let base = file_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| anyhow!("member {:?} has no filename", m.path))?;
+                sanitize_basename(base)?
+            }
+        };
+        let (content, encoding) = read_file_body(&file_path)?;
+        members.push(BundleMember { kind, filename, content, encoding, env: m.env });
+    }
+    Ok(members)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +556,66 @@ mod tests {
             kind: SecretKind::Env, filename: "../escape".into(), content: "x".into(), encoding: "utf8".into(), env: None,
         }]);
         assert!(materialize_bundle(&p, dir.path(), false).is_err());
+    }
+
+    #[test]
+    fn infer_kind_from_extension() {
+        assert_eq!(infer_kind(Path::new("a/.env")), SecretKind::Env);
+        assert_eq!(infer_kind(Path::new(".env.prod")), SecretKind::Env);
+        assert_eq!(infer_kind(Path::new("x.env")), SecretKind::Env);
+        assert_eq!(infer_kind(Path::new("cert.pem")), SecretKind::Pem);
+        assert_eq!(infer_kind(Path::new("server.crt")), SecretKind::Pem);
+        assert_eq!(infer_kind(Path::new("tls.key")), SecretKind::Pem);
+        assert_eq!(infer_kind(Path::new("creds.json")), SecretKind::Json);
+        assert_eq!(infer_kind(Path::new("kubeconfig")), SecretKind::Cred);
+    }
+
+    #[test]
+    fn read_file_body_utf8_and_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = dir.path().join("t.txt");
+        std::fs::write(&text, "hello").unwrap();
+        assert_eq!(read_file_body(&text).unwrap(), ("hello".to_string(), "utf8".to_string()));
+
+        let bin = dir.path().join("b.bin");
+        std::fs::write(&bin, [0u8, 159, 146, 150]).unwrap();
+        let (body, enc) = read_file_body(&bin).unwrap();
+        assert_eq!(enc, "base64");
+        use base64::prelude::*;
+        assert_eq!(BASE64_STANDARD.decode(body).unwrap(), vec![0u8, 159, 146, 150]);
+    }
+
+    #[test]
+    fn load_bundle_members_reads_and_infers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cert.pem"), "PEMDATA").unwrap();
+        std::fs::write(dir.path().join("app.json"), r#"{"k":1}"#).unwrap();
+        let manifest = dir.path().join("bundle.json");
+        std::fs::write(
+            &manifest,
+            r#"{"members":[
+                {"path":"cert.pem"},
+                {"path":"app.json","as":"json","filename":"creds.json","env":"GOOGLE_APPLICATION_CREDENTIALS"}
+            ]}"#,
+        )
+        .unwrap();
+        let members = load_bundle_members(&manifest).unwrap();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].kind, SecretKind::Pem);
+        assert_eq!(members[0].filename, "cert.pem");
+        assert_eq!(members[0].content, "PEMDATA");
+        assert_eq!(members[1].kind, SecretKind::Json);
+        assert_eq!(members[1].filename, "creds.json");
+        assert_eq!(members[1].env.as_deref(), Some("GOOGLE_APPLICATION_CREDENTIALS"));
+    }
+
+    #[test]
+    fn load_bundle_rejects_traversal_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f"), "x").unwrap();
+        let manifest = dir.path().join("m.json");
+        std::fs::write(&manifest, r#"{"members":[{"path":"f","filename":"../evil"}]}"#).unwrap();
+        assert!(load_bundle_members(&manifest).is_err());
     }
 
     #[test]

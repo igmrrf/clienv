@@ -100,9 +100,26 @@ enum Commands {
         #[arg(long)]
         content: Option<String>,
 
-        /// Path to text file containing the secret
+        /// Path to file containing the secret. With --as or a known extension the secret is
+        /// tagged for file materialization; otherwise its text is shared as-is (legacy).
         #[arg(short, long)]
         file: Option<PathBuf>,
+
+        /// Tag the secret's file kind: env | pem | json | cred (implies materializable).
+        #[arg(long = "as")]
+        as_kind: Option<String>,
+
+        /// Suggested output basename when materialized (default: basename of --file).
+        #[arg(long)]
+        filename: Option<String>,
+
+        /// Path to a bundle manifest JSON packing multiple files into one secret.
+        #[arg(long)]
+        bundle: Option<PathBuf>,
+
+        /// Seal the secret: refuse all file materialization (terminal view only).
+        #[arg(long = "no-export")]
+        no_export: bool,
 
         /// Time-to-live (e.g. 1m, 2h, 1d, 7d)
         #[arg(short, long, default_value = "24h")]
@@ -119,6 +136,32 @@ enum Commands {
         /// Password to unlock wallet if required
         #[arg(short, long)]
         password: Option<String>,
+    },
+
+    /// Materialize a shared secret to real file(s) on disk
+    Materialize {
+        /// Secret ID to materialize
+        secret_id: String,
+
+        /// Output directory (bundles require this; single files may use it too)
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
+
+        /// Output file path (single secrets only)
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+
+        /// Output format: env | pem | json | cred | schema (default: the secret's kind)
+        #[arg(long = "as")]
+        as_fmt: Option<String>,
+
+        /// Password to unlock wallet if required
+        #[arg(short, long)]
+        password: Option<String>,
+
+        /// Overwrite existing files
+        #[arg(long)]
+        force: bool,
     },
 
     /// View a shared secret
@@ -549,24 +592,68 @@ fn main() {
             secret,
             content,
             file,
+            as_kind,
+            filename,
+            bundle,
+            no_export,
             ttl,
             max_reads,
             to,
             password,
         }) => {
-            let secret_content = if let Some(c) = content {
-                c
+            // Resolve the secret content and its file-materialization metadata.
+            let (secret_content, mut meta) = if let Some(ref manifest) = bundle {
+                if content.is_some() || file.is_some() || secret.is_some() {
+                    eprintln!("Error: --bundle is mutually exclusive with --content/--file/positional secret.");
+                    std::process::exit(1);
+                }
+                match materialize::load_bundle_members(manifest) {
+                    Ok(members) => (
+                        String::new(),
+                        secrets::ShareMeta { members: Some(members), ..Default::default() },
+                    ),
+                    Err(e) => handle_cli_error("Error reading bundle manifest", e),
+                }
+            } else if let Some(c) = content {
+                (c, secrets::ShareMeta::default())
             } else if let Some(ref path) = file {
-                match std::fs::read_to_string(path) {
-                    Ok(c) => c,
-                    Err(e) => handle_cli_error("Error reading file", e.into()),
+                // A file share becomes a tagged, materializable secret when --as is given or
+                // the extension is recognizable; otherwise it stays a plain text share.
+                match materialize::read_file_body(path) {
+                    Ok((body, encoding)) => {
+                        let kind = match as_kind {
+                            Some(ref k) => match materialize::parse_kind(k) {
+                                Ok(kind) => Some(kind),
+                                Err(e) => handle_cli_error("Error parsing --as", e),
+                            },
+                            None => Some(materialize::infer_kind(path)),
+                        };
+                        let fname = filename.clone().unwrap_or_else(|| {
+                            path.file_name().and_then(|n| n.to_str()).unwrap_or("secret").to_string()
+                        });
+                        let fname = match materialize::sanitize_basename(&fname) {
+                            Ok(f) => f,
+                            Err(e) => handle_cli_error("Error with --filename", e),
+                        };
+                        (
+                            body,
+                            secrets::ShareMeta {
+                                kind,
+                                filename: Some(fname),
+                                content_encoding: Some(encoding),
+                                ..Default::default()
+                            },
+                        )
+                    }
+                    Err(e) => handle_cli_error("Error reading file", e),
                 }
             } else if let Some(s) = secret {
-                s
+                (s, secrets::ShareMeta::default())
             } else {
-                eprintln!("Error: Content to share is required. Use --content, --file, or positional secret text.");
+                eprintln!("Error: Content to share is required. Use --content, --file, --bundle, or positional secret text.");
                 std::process::exit(1);
             };
+            meta.no_export = no_export;
 
             let pwd = get_password_or_prompt(password, "Enter wallet password (if encrypted): ");
             let recipient = to.unwrap_or_else(|| "public".to_string());
@@ -575,7 +662,7 @@ fn main() {
                 Err(e) => handle_cli_error("Error getting wallet info", e),
             };
 
-            match secrets::share_secret(&secret_content, &ttl, max_reads, &recipient, &sender, pwd.as_deref(), secrets::ShareMeta::default()) {
+            match secrets::share_secret(&secret_content, &ttl, max_reads, &recipient, &sender, pwd.as_deref(), meta) {
                 Ok(rec) => {
                     println!("Secret shared successfully!");
                     println!("Secret ID: {}", rec.id);
@@ -623,6 +710,73 @@ fn main() {
                     }
                 }
                 Err(e) => handle_cli_error("Error viewing secret", e),
+            }
+        }
+
+        Some(Commands::Materialize {
+            secret_id,
+            dir,
+            file,
+            as_fmt,
+            password,
+            force,
+        }) => {
+            let pwd = get_password_or_prompt(password, "Enter wallet password (if encrypted): ");
+            let user_addr = match wallet::get_wallet_info(pwd.as_deref()) {
+                Ok(w) => w.address.clone(),
+                Err(e) => handle_cli_error("Error loading wallet", e),
+            };
+
+            // One materialize = one authorized read (a bundle counts as one, not N).
+            let payload = match secrets::view_payload(&secret_id, &user_addr, pwd.as_deref()) {
+                Ok(p) => p,
+                Err(e) => handle_cli_error("Error reading secret", e),
+            };
+
+            let explicit_fmt = match as_fmt.as_deref() {
+                Some(s) => match materialize::parse_format(s) {
+                    Ok(f) => Some(f),
+                    Err(e) => handle_cli_error("Error parsing --as", e),
+                },
+                None => None,
+            };
+
+            if payload.members.is_some() {
+                if file.is_some() {
+                    eprintln!("Error: --file is invalid for a bundle; use --dir.");
+                    std::process::exit(1);
+                }
+                let out_dir = dir.unwrap_or_else(|| PathBuf::from("."));
+                match materialize::materialize_bundle(&payload, &out_dir, force) {
+                    Ok(paths) => {
+                        for p in &paths {
+                            println!(
+                                "WARNING: plaintext secret written to {} (mode 0600). Delete when done.",
+                                p.display()
+                            );
+                        }
+                    }
+                    Err(e) => handle_cli_error("Error materializing bundle", e),
+                }
+            } else {
+                let fmt = materialize::resolve_format(explicit_fmt, payload.kind, &payload.content);
+                let out = if let Some(p) = file {
+                    materialize::OutTarget::File(p)
+                } else {
+                    materialize::OutTarget::Dir(dir.unwrap_or_else(|| PathBuf::from(".")))
+                };
+                match materialize::materialize_single(&payload, fmt, out, force) {
+                    Ok(path) => {
+                        if fmt == materialize::OutputFormat::Schema {
+                            println!("NOTE: key names disclosed (values withheld).");
+                        }
+                        println!(
+                            "WARNING: plaintext secret written to {} (mode 0600). Delete when done.",
+                            path.display()
+                        );
+                    }
+                    Err(e) => handle_cli_error("Error materializing secret", e),
+                }
             }
         }
 
