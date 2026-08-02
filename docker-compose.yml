@@ -6,14 +6,12 @@ services:
     image: ghcr.io/foundry-rs/foundry:latest
     container_name: bsec-local-testnet
     restart: unless-stopped
-    command: >
-      anvil
-      --host 0.0.0.0
-      --port 8545
-      --chain-id 31337
-      --block-time 1
-      --accounts 10
-      --balance 10000
+    # The image ENTRYPOINT is ["/bin/sh","-c"], which swallows all but the first token of any
+    # command (leaving anvil bound to its 127.0.0.1 default and the published port unreachable).
+    # Override the entrypoint to exec anvil directly so every flag reaches it. --host 0.0.0.0 is
+    # required to accept connections from the host.
+    entrypoint: ["anvil"]
+    command: ["--host", "0.0.0.0", "--port", "8545", "--chain-id", "31337", "--block-time", "1", "--accounts", "10", "--balance", "10000"]
     ports:
       - "8545:8545"
     healthcheck:
