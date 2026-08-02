@@ -168,10 +168,12 @@ pub fn share_secret(
 
     let ipfs_cid = upload_to_ipfs(&payload_json)?;
 
+    // Full 256-bit id (0x + 64 hex) so encode_bytes32_hex maps it losslessly onto the
+    // contract's bytes32 key. The previous 16-hex-char id was only 64 bits and, being
+    // non-hex-prefixed, was packed as ASCII bytes — inviting collisions on the on-chain key.
     let random_nonce: u64 = rand::random();
     let id_seed = format!("{}:{}:{}:{}", sender_address, to_address, now, random_nonce);
-    let id_hash = bytes_to_hex(&hash_digest(id_seed.as_bytes()));
-    let secret_id = id_hash[0..16].to_string();
+    let secret_id = format!("0x{}", bytes_to_hex(&hash_digest(id_seed.as_bytes())));
 
     let is_public = to_address == "public";
 
