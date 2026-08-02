@@ -345,30 +345,19 @@ pub fn get_wallet_info(password: Option<&str>) -> Result<WalletInfo> {
     }
 
     let content = fs::read_to_string(&wallet_path)?;
-    let mut wallet_file: WalletFile = serde_json::from_str(&content)?;
+    let wallet_file: WalletFile = serde_json::from_str(&content)?;
 
-    let mut info = if wallet_file.encrypted {
+    // Read-only: do NOT rewrite wallet.json here. The previous write-on-read updated
+    // `last_accessed` on every read, which raced under concurrent invocations (unsynchronized
+    // read-modify-write) and rewrote the plaintext key for unencrypted wallets. The marginal
+    // value of a read timestamp does not justify either hazard.
+    let info = if wallet_file.encrypted {
         let pwd = password.ok_or_else(|| anyhow!("Wallet is encrypted. Password is required."))?;
         let decrypted_json = Zeroizing::new(decrypt_wallet(&wallet_file.data, pwd)?);
         serde_json::from_str::<WalletInfo>(&decrypted_json)?
     } else {
         serde_json::from_str::<WalletInfo>(&wallet_file.data)?
     };
-
-    let now = current_timestamp();
-    info.last_accessed = now;
-    wallet_file.last_accessed = now;
-    // FAILSAFE DESIGN: For unencrypted wallets, update inner payload JSON string. For encrypted wallets,
-    // re-encrypting inner payload on every read would require re-prompting for password or caching plaintext key.
-    // Updating outer `last_accessed` metadata allows access tracking without security risks or password re-prompt.
-    if !wallet_file.encrypted {
-        if let Ok(json_str) = serde_json::to_string(&info) {
-            wallet_file.data = json_str;
-        }
-    }
-    if let Err(e) = write_secure_file(&wallet_path, serde_json::to_string_pretty(&wallet_file)?.as_bytes()) {
-        log::warn!("Failed to update wallet last_accessed timestamp on disk: {}", e);
-    }
 
     Ok(info)
 }
