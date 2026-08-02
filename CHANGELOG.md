@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased — secret → file materialization
+
+Additive feature: a shared secret can now be materialized into one or more real files, carry
+a multi-file bundle, expose a keys-only schema, and be staged for `run`. No contract change;
+existing shared secrets (`view`, `view --output`, `run --env-file`) behave exactly as before.
+
+### New
+
+- **`bsec materialize <id>`** writes a decrypted secret to real file(s) at mode `0600` under
+  `0700` directories. `--file`/`--dir` choose the target; `--as env|pem|json|cred|schema`
+  overrides the format; `--force` overwrites. One materialize = one on-chain read (a bundle
+  counts as one, not N). Untagged legacy secrets resolve their format by content sniff.
+- **`share` file/bundle flags.** `--file` now infers a file `kind` (or takes `--as`), records a
+  suggested `--filename`, and base64-encodes binary bodies. `--bundle <manifest.json>` packs
+  several files into one secret. `--no-export` seals a secret against all file writes.
+- **`run --secret <id>`** stages a bundle / file-kind secret into a temp dir wiped on exit
+  (Drop plus a best-effort SIGINT/SIGTERM handler), injecting `<STEM>_FILE=<abspath>` per
+  member, any manifest `env` alias, and env-member `KEY=VAL` pairs.
+- **`materialize --as schema`** emits sorted `KEY=` lines (values withheld) for env/json/cred
+  secrets — the format `validate`/`generate` already consume.
+
+### Security
+
+- **Bundle member bodies are encrypted at rest.** Only `IpfsPayload.content`/`content_key`
+  are ciphertext; the payload JSON itself is stored on IPFS in cleartext. Each bundle member's
+  body is therefore sealed with the per-secret content key before upload — otherwise bundled
+  secrets would leak in cleartext. (The design note that called the whole payload AEAD-encrypted
+  did not match this codebase.)
+- **Filename safety.** Sender-supplied filenames are sanitized to plain basenames — path
+  separators, `..` traversal, `~` expansion, absolute paths, and NUL are rejected.
+- **`no_export` seal.** Blocks `materialize`, `materialize --as schema`, and `view --output`;
+  allows terminal `view` and `run --secret` staging (temp-only, wiped). Documented as an
+  in-tool control, not a cryptographic guarantee, in the README security model.
+- **`view --output` now writes mode 0600** (was a plain world-readable `fs::write`).
+
 ## Unreleased — real on-chain + IPFS, security & correctness hardening
 
 Production-readiness pass. Replaces the simulated blockchain/IPFS layers with real

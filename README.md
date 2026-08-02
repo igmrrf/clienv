@@ -37,6 +37,15 @@ Read this before relying on `bsec` for sensitive data.
 - **Wallet at rest.** Always create wallets with `--password` (Argon2id + AES-256-GCM).
   Without a password the private key and mnemonic are stored unencrypted (mode 0600) and
   `init` prints a warning.
+- **`--no-export` is an in-tool control, not a cryptographic guarantee.** Sealing a secret
+  makes `bsec` refuse to write it to a file (`materialize`, `materialize --as schema`, and
+  `view --output` are all blocked); terminal `view` and `run --secret` staging still work.
+  But a recipient holds the plaintext after decrypt and can persist it by any other means.
+  Treat the seal as a guard rail against accidental file writes, not as DRM.
+- **Materialized files are plaintext on disk.** `materialize` and `run --secret` write real
+  secret files at mode `0600` under `0700` directories. `run --secret` stages into a temp
+  dir wiped on exit (including SIGINT/SIGTERM, best-effort); `materialize` files persist —
+  delete them when done. `materialize --as schema` discloses key *names* (values withheld).
 
 ---
 
@@ -123,6 +132,50 @@ bsec revoke <secret_id>
 # Hide secret(s)
 bsec hide <secret_id>
 ```
+
+### 3b. Materializing Secrets to Files
+
+Some apps need a real file at a path (TLS `key.pem`, a Google `service-account.json`, a
+`kubeconfig`) rather than env vars. Tag a shared secret with its file kind, then materialize
+it — or stage it for a command with `run --secret`.
+
+```bash
+# Share a file as a tagged, materializable secret (kind inferred from extension, or --as)
+bsec share --file ./cert.pem --to 0x04<recipient-pubkey>
+bsec share --file ./creds.json --as json --filename service-account.json --to 0x04...
+
+# Seal it: bsec will refuse every file write (terminal view only)
+bsec share --file ./cert.pem --no-export --to 0x04...
+
+# Pack several files into one secret via a bundle manifest
+cat > bundle.json <<'JSON'
+{ "members": [
+  { "path": "./cert.pem",  "as": "pem",  "filename": "cert.pem" },
+  { "path": "./creds.json", "as": "json", "filename": "creds.json",
+    "env": "GOOGLE_APPLICATION_CREDENTIALS" },
+  { "path": "./.env.prod",  "as": "env",  "filename": ".env" }
+] }
+JSON
+bsec share --bundle bundle.json --to 0x04...
+
+# Materialize a single secret to a file or directory (mode 0600). One call = one read.
+bsec materialize <secret_id> --file ./out/cert.pem
+bsec materialize <secret_id> --dir ./out            # uses the sender's suggested filename
+
+# Materialize a bundle: every member is written under --dir
+bsec materialize <secret_id> --dir ./secrets
+
+# Extract just the KEY names (no values) as a .env.schema
+bsec materialize <secret_id> --as schema --file .env.schema
+
+# Stage files into a wiped-on-exit temp dir and run a command. For each member, bsec injects
+# <STEM>_FILE=<abspath> (plus any manifest "env" alias); env members also inject KEY=VAL.
+bsec run --secret <secret_id> -- sh -c 'echo "$GOOGLE_APPLICATION_CREDENTIALS"; cat "$CERT_FILE"'
+```
+
+Notes: sender-supplied filenames are sanitized to plain basenames (no `..`, no separators).
+Binary bodies (keystores, DER) are stored base64 and restored to raw bytes on write.
+`--force` is required to overwrite an existing file.
 
 ### 4. Network Configuration
 
