@@ -575,7 +575,7 @@ fn main() {
                 Err(e) => handle_cli_error("Error getting wallet info", e),
             };
 
-            match secrets::share_secret(&secret_content, &ttl, max_reads, &recipient, &sender, pwd.as_deref()) {
+            match secrets::share_secret(&secret_content, &ttl, max_reads, &recipient, &sender, pwd.as_deref(), secrets::ShareMeta::default()) {
                 Ok(rec) => {
                     println!("Secret shared successfully!");
                     println!("Secret ID: {}", rec.id);

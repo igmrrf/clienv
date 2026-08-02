@@ -146,6 +146,35 @@ fn decrypt_text(cipher_str: &str, key_bytes: &[u8; 32]) -> Result<String> {
     String::from_utf8(plain_bytes).map_err(|e| anyhow!("utf8 error: {}", e))
 }
 
+/// Encrypt each bundle member's plaintext body in place with the content key. The IPFS
+/// payload JSON is stored cleartext except for these AES-256-GCM ciphertext fields, so
+/// member bodies MUST be sealed before upload or they would leak on IPFS.
+fn seal_member_bodies(members: &mut [BundleMember], key: &[u8; 32]) -> Result<()> {
+    for m in members.iter_mut() {
+        m.content = encrypt_text(&m.content, key)?;
+    }
+    Ok(())
+}
+
+/// Decrypt each bundle member's body in place (inverse of `seal_member_bodies`).
+fn open_member_bodies(members: &mut [BundleMember], key: &[u8; 32]) -> Result<()> {
+    for m in members.iter_mut() {
+        m.content = decrypt_text(&m.content, key)?;
+    }
+    Ok(())
+}
+
+/// Metadata describing how a shared secret should be materialized to file(s).
+#[derive(Default)]
+pub struct ShareMeta {
+    pub kind: Option<SecretKind>,
+    pub filename: Option<String>,
+    pub no_export: bool,
+    pub content_encoding: Option<String>,
+    /// Plaintext bundle members; their bodies are sealed before upload.
+    pub members: Option<Vec<BundleMember>>,
+}
+
 fn resolve_recipient_pubkey(to_address: &str, sender_info: &crate::wallet::WalletInfo) -> Result<Option<PublicKey>> {
     if to_address.to_lowercase() == sender_info.address.to_lowercase() || to_address == sender_info.public_key {
         let pub_bytes = hex_to_bytes(&sender_info.public_key)?;
@@ -180,8 +209,14 @@ pub fn share_secret(
     to_address: &str,
     sender_address: &str,
     password: Option<&str>,
+    meta: ShareMeta,
 ) -> Result<SecretRecord> {
-    if content.len() > 10 * 1024 * 1024 {
+    let members_size: usize = meta
+        .members
+        .as_ref()
+        .map(|ms| ms.iter().map(|m| m.content.len()).sum())
+        .unwrap_or(0);
+    if content.len() + members_size > 10 * 1024 * 1024 {
         return Err(anyhow!("Secret content size exceeds maximum limit of 10MB."));
     }
 
@@ -214,15 +249,25 @@ pub fn share_secret(
     let encrypted_content = encrypt_text(content, &random_content_key)?;
     let encrypted_content_key = encrypt_text(&BASE64_STANDARD.encode(random_content_key.as_ref()), &wrapper_key)?;
 
+    // Seal bundle member bodies with the same content key before upload (they would
+    // otherwise sit in cleartext inside the IPFS payload JSON).
+    let sealed_members = match meta.members {
+        Some(mut ms) => {
+            seal_member_bodies(&mut ms, &random_content_key)?;
+            Some(ms)
+        }
+        None => None,
+    };
+
     let payload = IpfsPayload {
         content: encrypted_content.clone(),
         content_key: encrypted_content_key.clone(),
         ephemeral_pubkey: Some(ephemeral_pub_hex.clone()),
-        kind: None,
-        filename: None,
-        no_export: false,
-        members: None,
-        content_encoding: None,
+        kind: meta.kind,
+        filename: meta.filename,
+        no_export: meta.no_export,
+        members: sealed_members,
+        content_encoding: meta.content_encoding,
     };
     let payload_json = serde_json::to_string(&payload)?;
 
@@ -281,6 +326,14 @@ pub fn share_secret(
 }
 
 pub fn view_secret(secret_id: &str, user_address: &str, password: Option<&str>) -> Result<String> {
+    Ok(view_payload(secret_id, user_address, password)?.content)
+}
+
+/// Decrypt a secret and return the WHOLE payload (metadata + plaintext content + plaintext
+/// member bodies). Performs authorization, expiry/read-limit checks, and consumes exactly
+/// one on-chain read — a bundle counts as one read, not N. Materialize needs this instead
+/// of the flattened `view_secret` string because it must see kind/filename/members/no_export.
+pub fn view_payload(secret_id: &str, user_address: &str, password: Option<&str>) -> Result<IpfsPayload> {
     let onchain_info = get_secret_info_on_chain(secret_id)?;
 
     let wallet_info = crate::wallet::get_wallet_info(password)?;
@@ -351,13 +404,36 @@ pub fn view_secret(secret_id: &str, user_address: &str, password: Option<&str>) 
     }
     key_bytes.copy_from_slice(&key_bytes_vec);
 
-    let decrypted = decrypt_text(&payload.content, &key_bytes)?;
+    let decrypted_content = if payload.content.is_empty() {
+        String::new()
+    } else {
+        decrypt_text(&payload.content, &key_bytes)?
+    };
+
+    // Unseal bundle member bodies with the same content key.
+    let decrypted_members = match payload.members {
+        Some(mut ms) => {
+            open_member_bodies(&mut ms, &key_bytes)?;
+            Some(ms)
+        }
+        None => None,
+    };
 
     let priv_bytes = Zeroizing::new(hex_to_bytes(&wallet_info.private_key)?);
     record_read_on_chain(&priv_bytes, secret_id)?;
     crate::blockchain::index_note(secret_id, "recipient");
 
-    Ok(decrypted)
+    Ok(IpfsPayload {
+        content: decrypted_content,
+        // content_key is consumed above; do not surface the wrapped key to callers.
+        content_key: String::new(),
+        ephemeral_pubkey: payload.ephemeral_pubkey,
+        kind: payload.kind,
+        filename: payload.filename,
+        no_export: payload.no_export,
+        members: decrypted_members,
+        content_encoding: payload.content_encoding,
+    })
 }
 
 pub fn load_secret_as_env(secret_id: &str, user_address: &str, password: Option<&str>) -> Result<BTreeMap<String, String>> {
@@ -507,6 +583,22 @@ mod tests {
         assert_eq!(m[0].filename, "cert.pem");
         assert_eq!(m[0].encoding, "base64");
         assert_eq!(m[0].env.as_deref(), Some("TLS_CERT"));
+    }
+
+    #[test]
+    fn member_bodies_seal_open_roundtrip() {
+        let key = [7u8; 32];
+        let mut members = vec![
+            BundleMember { kind: SecretKind::Pem, filename: "cert.pem".into(), content: "PEM BODY".into(), encoding: "utf8".into(), env: None },
+            BundleMember { kind: SecretKind::Env, filename: ".env".into(), content: "K=V".into(), encoding: "utf8".into(), env: None },
+        ];
+        seal_member_bodies(&mut members, &key).unwrap();
+        // sealed bodies are ciphertext, not the original plaintext
+        assert_ne!(members[0].content, "PEM BODY");
+        assert!(members[0].content.contains(':'));
+        open_member_bodies(&mut members, &key).unwrap();
+        assert_eq!(members[0].content, "PEM BODY");
+        assert_eq!(members[1].content, "K=V");
     }
 
     #[test]
