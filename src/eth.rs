@@ -305,6 +305,8 @@ pub fn eth_call(conf: &NetworkConfig, to: &[u8; 20], data: &[u8]) -> Result<Vec<
 }
 
 /// Sign an EIP-155 legacy transaction and return the 0x-prefixed raw tx.
+// A legacy tx has nine RLP fields; passing them individually is clearer than a wrapper struct.
+#[allow(clippy::too_many_arguments)]
 fn sign_legacy_tx(
     priv_bytes: &[u8],
     nonce: u128,

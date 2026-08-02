@@ -491,7 +491,7 @@ fn main() {
                             // copy of the secret), then the buffer is wiped on drop.
                             let rendered =
                                 wallet::render_wallet_json(&info, show_private_key, show_mnemonic);
-                            println!("{}", &*rendered);
+                            println!("{}", *rendered);
                         } else {
                             let public_info = wallet::WalletInfoPublic::from(&info);
                             if let Ok(j) = serde_json::to_string_pretty(&public_info) {

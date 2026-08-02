@@ -324,7 +324,6 @@ pub fn share_secret(
     Ok(record)
 }
 
-#[allow(dead_code)] // retained flatten-to-string API; view now goes through view_payload
 pub fn view_secret(secret_id: &str, user_address: &str, password: Option<&str>) -> Result<String> {
     Ok(view_payload(secret_id, user_address, password)?.content)
 }
@@ -436,6 +435,19 @@ pub fn view_payload(secret_id: &str, user_address: &str, password: Option<&str>)
     })
 }
 
+/// Decrypt a secret and flatten it into a KEY=VALUE map (env or JSON object). Retained helper
+/// for env-style consumers; `run --secret` uses `view_payload` directly so it can also stage
+/// file-kind and bundle secrets (calling this would double-count the on-chain read).
+#[allow(dead_code)]
+pub fn load_secret_as_env(secret_id: &str, user_address: &str, password: Option<&str>) -> Result<std::collections::BTreeMap<String, String>> {
+    let decrypted_content = view_secret(secret_id, user_address, password)?;
+    if decrypted_content.trim().starts_with('{') {
+        crate::env_file::parse_json_content(&decrypted_content)
+    } else {
+        Ok(crate::env_file::parse_env_content(&decrypted_content))
+    }
+}
+
 pub fn list_secrets(
     user_address: &str,
     filter_user: Option<&str>,
@@ -484,8 +496,8 @@ pub fn hide_secret(
     let mut hidden_count = 0;
 
     for (id, rec) in onchain_list {
-        let matches_id = secret_id.map_or(true, |target| id == target);
-        let matches_filter = user_filter.map_or(true, |target| {
+        let matches_id = secret_id.is_none_or(|target| id == target);
+        let matches_filter = user_filter.is_none_or(|target| {
             rec.recipient.to_lowercase() == target.to_lowercase()
                 || rec.sender.to_lowercase() == target.to_lowercase()
         });
