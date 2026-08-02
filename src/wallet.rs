@@ -228,6 +228,80 @@ pub fn decrypt_wallet(encrypted_str: &str, password: &str) -> Result<String> {
     }
 }
 
+/// Append `s` as a JSON string literal (quoted + escaped) directly into `out`.
+/// Writes byte-by-byte into the caller's buffer so a secret value never lands in a
+/// separate, un-zeroized allocation (as `format!`/`serde_json::Value` would).
+fn json_escape_into(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str("\\u");
+                for shift in [12u32, 8, 4, 0] {
+                    let nib = (c as u32 >> shift) & 0xf;
+                    out.push(char::from_digit(nib, 16).unwrap_or('0'));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Render a wallet as a pretty JSON object into a `Zeroizing<String>`, optionally including
+/// the private key and/or mnemonic. Secrets are written straight into a single pre-sized
+/// buffer — never routed through `serde_json::Value` or `serde_json::to_string` (whose
+/// internal buffer growth leaves freed, un-zeroized plaintext copies). The buffer is reserved
+/// once with enough headroom that no reallocation occurs, so the only heap residence of the
+/// plaintext is this buffer, which is wiped on drop.
+///
+/// With both flags set the output carries every `WalletInfo` field, so it round-trips through
+/// `serde_json::from_str::<WalletInfo>` — this is also the on-disk serialization used at init.
+pub fn render_wallet_json(
+    info: &WalletInfo,
+    include_private_key: bool,
+    include_mnemonic: bool,
+) -> Zeroizing<String> {
+    let cap = 1024
+        + info.address.len()
+        + info.public_key.len()
+        + info.user_id.as_deref().map_or(0, str::len)
+        + if include_private_key { info.private_key.len() } else { 0 }
+        + if include_mnemonic { info.mnemonic.len() } else { 0 };
+    let mut out = Zeroizing::new(String::with_capacity(cap));
+    let o: &mut String = &mut out;
+
+    o.push_str("{\n");
+    o.push_str("  \"address\": ");
+    json_escape_into(o, &info.address);
+    o.push_str(",\n  \"public_key\": ");
+    json_escape_into(o, &info.public_key);
+    o.push_str(",\n  \"created_at\": ");
+    o.push_str(&info.created_at.to_string());
+    o.push_str(",\n  \"last_accessed\": ");
+    o.push_str(&info.last_accessed.to_string());
+    o.push_str(",\n  \"user_id\": ");
+    match &info.user_id {
+        Some(uid) => json_escape_into(o, uid),
+        None => o.push_str("null"),
+    }
+    if include_private_key {
+        o.push_str(",\n  \"private_key\": ");
+        json_escape_into(o, &info.private_key);
+    }
+    if include_mnemonic {
+        o.push_str(",\n  \"mnemonic\": ");
+        json_escape_into(o, &info.mnemonic);
+    }
+    o.push_str("\n}");
+    out
+}
+
 pub fn generate_mnemonic() -> Result<String> {
     let mut entropy = [0u8; 16];
     OsRng.fill_bytes(&mut entropy);
@@ -301,9 +375,11 @@ pub fn init_wallet(
         user_id: user_id.clone(),
     };
 
-    // Zeroizing: the serialized blob contains the plaintext private key and mnemonic. Wiping it
-    // after use keeps the encrypted path from leaving the plaintext lingering in freed memory.
-    let raw_data = Zeroizing::new(serde_json::to_string(&wallet_info)?);
+    // The serialized blob contains the plaintext private key and mnemonic. Build it with the
+    // manual writer (not serde_json::to_string, whose buffer growth leaves freed un-zeroized
+    // copies) into a single pre-sized Zeroizing buffer, so the only plaintext residence is this
+    // buffer — wiped on drop. It carries every field, so it round-trips via serde on read.
+    let raw_data = render_wallet_json(&wallet_info, true, true);
 
     let wallet_file = if let Some(ref pwd) = password {
         let encrypted_data = encrypt_wallet(raw_data.as_str(), pwd)?;

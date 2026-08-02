@@ -40,6 +40,14 @@ implementations and fixes the security/correctness findings from the code review
   the Rust view path guards the same way.
 - **Wallet plaintext zeroized on init.** The serialized wallet blob (plaintext private key +
   mnemonic) is wrapped in `Zeroizing` so the encrypted path does not leave it in freed memory.
+- **Airtight secret rendering.** The serialized wallet blob (on init) and the
+  `wallet info --json --show-private-key/--show-mnemonic` output are now built by a manual JSON
+  writer into a single pre-sized `Zeroizing` buffer, instead of `serde_json::to_string` /
+  `serde_json::Value` + a `.clone()` of the key. That removes the un-zeroized plaintext copies
+  serde's growing buffer and intermediate `Value` left in freed heap. Text and `export` paths
+  already printed secrets by reference (no owned copy). The plaintext's only in-process
+  residence we control is now the one wiped-on-drop buffer; what's written to stdout is the
+  intended sink and out of scope.
 
 ### Correctness
 

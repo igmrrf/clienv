@@ -442,19 +442,12 @@ fn main() {
                 Ok(info) => {
                     if json {
                         if show_private_key || show_mnemonic {
-                            let mut map = serde_json::to_value(wallet::WalletInfoPublic::from(&info))
-                                .unwrap_or_default();
-                            if let Some(obj) = map.as_object_mut() {
-                                if show_private_key {
-                                    obj.insert("private_key".to_string(), serde_json::Value::String(info.private_key.clone()));
-                                }
-                                if show_mnemonic {
-                                    obj.insert("mnemonic".to_string(), serde_json::Value::String(info.mnemonic.clone()));
-                                }
-                            }
-                            if let Ok(j) = serde_json::to_string_pretty(&map) {
-                                println!("{}", j);
-                            }
+                            // Manual, pre-sized Zeroizing render: no clone, no serde_json::Value
+                            // holding plaintext. println writes the &str by reference (no owned
+                            // copy of the secret), then the buffer is wiped on drop.
+                            let rendered =
+                                wallet::render_wallet_json(&info, show_private_key, show_mnemonic);
+                            println!("{}", &*rendered);
                         } else {
                             let public_info = wallet::WalletInfoPublic::from(&info);
                             if let Ok(j) = serde_json::to_string_pretty(&public_info) {
