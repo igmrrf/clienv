@@ -379,6 +379,166 @@ pub fn load_bundle_members(manifest_path: &Path) -> Result<Vec<BundleMember>> {
     Ok(members)
 }
 
+/// Derive the injected env var name for a staged file: uppercased filename stem with
+/// leading dots stripped and non-alphanumerics folded to `_`, suffixed `_FILE`.
+/// e.g. "service-account.json" -> "SERVICE_ACCOUNT_FILE"; ".env" -> "ENV_FILE".
+pub fn stem_env_key(filename: &str) -> String {
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(filename);
+    let cleaned: String = stem
+        .trim_start_matches('.')
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .collect();
+    let cleaned = cleaned.trim_matches('_');
+    format!("{}_FILE", if cleaned.is_empty() { "SECRET" } else { cleaned })
+}
+
+fn is_file_kind(kind: SecretKind) -> bool {
+    matches!(kind, SecretKind::Pem | SecretKind::Json | SecretKind::Cred)
+}
+
+/// RAII temp dir (0700) that wipes itself on Drop; used by `run --secret` staging.
+pub struct StagedDir {
+    path: PathBuf,
+}
+
+impl StagedDir {
+    /// Create a fresh `<os-temp>/bsec-<random-hex>/` dir at mode 0700.
+    pub fn new() -> Result<Self> {
+        use aes_gcm::aead::rand_core::RngCore;
+        use aes_gcm::aead::OsRng;
+        let mut buf = [0u8; 16];
+        OsRng.fill_bytes(&mut buf);
+        let suffix: String = buf.iter().map(|b| format!("{:02x}", b)).collect();
+        let path = std::env::temp_dir().join(format!("bsec-{}", suffix));
+        std::fs::create_dir(&path).map_err(|e| anyhow!("creating staging dir: {}", e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        }
+        register_staged_dir(&path);
+        Ok(Self { path })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Write one already-decrypted member into the staging dir as a 0600 file; return its path.
+    pub fn stage_member(&self, m: &BundleMember) -> Result<PathBuf> {
+        let name = sanitize_basename(&m.filename)?;
+        let path = self.path.join(name);
+        let bytes = decode_body(&m.content, &m.encoding)?;
+        crate::wallet::write_secure_file(&path, &bytes)?;
+        Ok(path)
+    }
+}
+
+impl Drop for StagedDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+        unregister_staged_dir(&self.path);
+    }
+}
+
+use std::sync::Mutex;
+lazy_static::lazy_static! {
+    static ref STAGED_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+}
+
+fn register_staged_dir(path: &Path) {
+    if let Ok(mut dirs) = STAGED_DIRS.lock() {
+        if dirs.is_empty() {
+            install_signal_cleanup();
+        }
+        dirs.push(path.to_path_buf());
+    }
+}
+
+fn unregister_staged_dir(path: &Path) {
+    if let Ok(mut dirs) = STAGED_DIRS.lock() {
+        dirs.retain(|p| p != path);
+    }
+}
+
+#[cfg(unix)]
+fn install_signal_cleanup() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        libc::signal(libc::SIGINT, signal_cleanup_handler as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, signal_cleanup_handler as libc::sighandler_t);
+    });
+}
+
+#[cfg(not(unix))]
+fn install_signal_cleanup() {}
+
+/// Best-effort staged-dir removal on SIGINT/SIGTERM, then terminate with the conventional
+/// 128+signal code. Filesystem ops here are not strictly async-signal-safe, but this is a
+/// last-ditch cleanup so no plaintext lingers when the process is interrupted.
+#[cfg(unix)]
+extern "C" fn signal_cleanup_handler(sig: libc::c_int) {
+    if let Ok(dirs) = STAGED_DIRS.lock() {
+        for p in dirs.iter() {
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
+    unsafe {
+        libc::_exit(128 + sig);
+    }
+}
+
+/// If a decrypted secret carries file members or a file-kind body, stage them into a fresh
+/// temp dir and return (guard, env map). Returns Ok(None) for plain env/untagged secrets so
+/// the caller falls back to variable injection. Env-kind members are BOTH staged and parsed.
+pub fn stage_and_envs(
+    payload: &IpfsPayload,
+) -> Result<Option<(StagedDir, std::collections::BTreeMap<String, String>)>> {
+    // Materialize into an owned member list so single-file and bundle share one code path.
+    let members: Vec<BundleMember> = if let Some(ms) = &payload.members {
+        ms.clone()
+    } else if let Some(kind) = payload.kind {
+        if is_file_kind(kind) {
+            let filename = payload.filename.clone().unwrap_or_else(|| default_filename(kind.as_format()).to_string());
+            vec![BundleMember {
+                kind,
+                filename,
+                content: payload.content.clone(),
+                encoding: payload.content_encoding.clone().unwrap_or_else(|| "utf8".to_string()),
+                env: None,
+            }]
+        } else {
+            return Ok(None); // env-kind single secret -> inject vars, no staging
+        }
+    } else {
+        return Ok(None); // untagged -> legacy env/json injection
+    };
+
+    let staged = StagedDir::new()?;
+    let mut envs = std::collections::BTreeMap::new();
+    for m in &members {
+        let path = staged.stage_member(m)?;
+        let abs = path.canonicalize().unwrap_or(path);
+        let abs_str = abs.to_string_lossy().to_string();
+        envs.insert(stem_env_key(&m.filename), abs_str.clone());
+        if let Some(ref env_name) = m.env {
+            envs.insert(env_name.clone(), abs_str.clone());
+        }
+        // env-kind members also contribute their KEY=VAL pairs to the child environment.
+        if m.kind == SecretKind::Env && m.encoding == "utf8" {
+            for (k, v) in crate::env_file::parse_env_content(&m.content) {
+                envs.insert(k, v);
+            }
+        }
+    }
+    Ok(Some((staged, envs)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,6 +716,51 @@ mod tests {
             kind: SecretKind::Env, filename: "../escape".into(), content: "x".into(), encoding: "utf8".into(), env: None,
         }]);
         assert!(materialize_bundle(&p, dir.path(), false).is_err());
+    }
+
+    #[test]
+    fn stem_env_key_forms() {
+        assert_eq!(stem_env_key("service-account.json"), "SERVICE_ACCOUNT_FILE");
+        assert_eq!(stem_env_key("cert.pem"), "CERT_FILE");
+        assert_eq!(stem_env_key(".env"), "ENV_FILE");
+        assert_eq!(stem_env_key("kubeconfig"), "KUBECONFIG_FILE");
+    }
+
+    #[test]
+    fn stage_and_envs_none_for_env_and_untagged() {
+        assert!(stage_and_envs(&payload("K=V", Some(SecretKind::Env))).unwrap().is_none());
+        assert!(stage_and_envs(&payload("anything", None)).unwrap().is_none());
+    }
+
+    #[test]
+    fn stage_and_envs_stages_bundle_with_file_and_env_vars() {
+        let mut p = payload("", None);
+        p.members = Some(vec![
+            BundleMember { kind: SecretKind::Json, filename: "creds.json".into(), content: "{}".into(), encoding: "utf8".into(), env: Some("GOOGLE_APPLICATION_CREDENTIALS".into()) },
+            BundleMember { kind: SecretKind::Env, filename: ".env".into(), content: "DB=postgres\nPORT=5432".into(), encoding: "utf8".into(), env: None },
+        ]);
+        let (staged, envs) = stage_and_envs(&p).unwrap().unwrap();
+        // json member staged with its explicit env alias + stem key
+        let creds = envs.get("GOOGLE_APPLICATION_CREDENTIALS").unwrap();
+        assert!(std::path::Path::new(creds).exists());
+        assert_eq!(envs.get("CREDS_FILE").unwrap(), creds);
+        // env member both staged (ENV_FILE) and parsed into vars
+        assert!(envs.contains_key("ENV_FILE"));
+        assert_eq!(envs.get("DB").unwrap(), "postgres");
+        assert_eq!(envs.get("PORT").unwrap(), "5432");
+        // dir wiped on drop
+        let dir = staged.path().to_path_buf();
+        assert!(dir.exists());
+        drop(staged);
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn stage_and_envs_single_file_kind() {
+        let mut p = payload("-----BEGIN CERT-----", Some(SecretKind::Pem));
+        p.filename = Some("tls.pem".into());
+        let (_staged, envs) = stage_and_envs(&p).unwrap().unwrap();
+        assert!(envs.contains_key("TLS_FILE"));
     }
 
     #[test]

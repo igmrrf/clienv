@@ -410,6 +410,8 @@ pub fn run_with_envs(
     }
 
     let mut env_map = BTreeMap::new();
+    // Keeps any `run --secret` staging dir alive until the child exits; its Drop wipes it.
+    let mut _staged_guard: Option<crate::materialize::StagedDir> = None;
 
     let proj_config = crate::project_config::load_project_config();
 
@@ -425,8 +427,22 @@ pub fn run_with_envs(
 
     if let Some(sec_id) = target_secret_id {
         let user_addr = crate::wallet::get_wallet_info(password)?.address.clone();
-        let sec_vars = crate::secrets::load_secret_as_env(sec_id, &user_addr, password)?;
-        env_map.extend(sec_vars);
+        // One decrypt / one on-chain read, then decide: stage files or inject vars.
+        let payload = crate::secrets::view_payload(sec_id, &user_addr, password)?;
+        match crate::materialize::stage_and_envs(&payload)? {
+            Some((staged, envs)) => {
+                _staged_guard = Some(staged);
+                env_map.extend(envs);
+            }
+            None => {
+                let vars = if payload.content.trim_start().starts_with('{') {
+                    parse_json_content(&payload.content)?
+                } else {
+                    parse_env_content(&payload.content)
+                };
+                env_map.extend(vars);
+            }
+        }
     }
 
     if let Some(file_path) = target_env_file {

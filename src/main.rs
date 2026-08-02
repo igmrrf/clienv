@@ -686,8 +686,17 @@ fn main() {
                 Err(e) => handle_cli_error("Error loading wallet", e),
             };
 
-            match secrets::view_secret(&secret_id, &user_addr, pwd.as_deref()) {
-                Ok(content) => {
+            match secrets::view_payload(&secret_id, &user_addr, pwd.as_deref()) {
+                Ok(payload) => {
+                    let content = payload.content;
+                    if output.is_some() && payload.no_export {
+                        // Writing plaintext to a file is exactly what the seal forbids.
+                        eprintln!("Error: sender sealed this secret (--no-export); terminal view only");
+                        std::process::exit(3);
+                    }
+                    if payload.members.is_some() && output.is_none() && !json {
+                        println!("This secret is a bundle of files. Run: bsec materialize {} --dir <DIR>", secret_id);
+                    }
                     if json {
                         let mut map = std::collections::BTreeMap::new();
                         map.insert("secret_id", secret_id.clone());
@@ -696,7 +705,8 @@ fn main() {
                             println!("{}", j);
                         }
                     } else if let Some(out_path) = output {
-                        if let Err(e) = std::fs::write(&out_path, &content) {
+                        // Preserve 0600 semantics for written secret files.
+                        if let Err(e) = wallet::write_secure_file(&out_path, content.as_bytes()) {
                             eprintln!("Error writing output file: {}", e);
                             std::process::exit(1);
                         } else {

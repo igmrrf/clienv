@@ -37,6 +37,9 @@ reqwest = { version = "0.12", features = ["blocking", "json", "multipart"] }
 thiserror = "2.0.12"
 clap_complete = "4.5.44"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 assert_cmd = "2.0.16"
 assert_fs = "1.1.2"
