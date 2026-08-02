@@ -13,7 +13,30 @@ A powerful, high-performance CLI tool written in Rust for secure, decentralized 
 - 📝 **Schema Validation & Templates**: Validate `.env` files against `.env.schema`, auto-fix missing keys, and generate `.env.template` files (`generate`).
 - 🔐 **End-to-End File Encryption**: Encrypt (`encrypt`) and decrypt (`decrypt`) `.env` files using `$DOTENV_PASS`, `$DOTENV_<ENV>_PASS`, or `.env.pass` files.
 - 📋 **Environment Variable Logging**: Inspect single variable values (`log`).
-- ⚡ **Built-in Fast Storage**: Simple encrypted key-value store (`set`, `get`) and pattern search (`search`).
+- 🔎 **Pattern Search**: Substring search within files (`search`).
+
+---
+
+## Security Model & Limitations
+
+Read this before relying on `bsec` for sensitive data.
+
+- **Confidentiality is cryptographic; access controls are advisory.** Secret payloads are
+  encrypted with AES-256-GCM under a per-secret random key, which is wrapped for the
+  recipient via ECDH (secp256k1) + HKDF-SHA256. Only the holder of the recipient private key
+  can decrypt. The on-chain `expiresAt`, `maxReads`, and `revoked` fields gate *listing and
+  the recorded read count* — they do **not** cryptographically prevent a recipient who has
+  already fetched the IPFS payload from decrypting it again offline. Treat TTL / max-reads /
+  revocation as best-effort lifecycle signals, not hard guarantees against a past recipient.
+- **`--to public` provides no confidentiality.** Public secrets are wrapped with a fixed,
+  well-known key so anyone can read them. Use it only for non-sensitive content.
+- **Real backends required.** `share`/`view` perform real on-chain transactions (a funded
+  wallet + deployed `BsecSecretRegistry`) and real IPFS storage (a Pinata JWT or a reachable
+  IPFS daemon). With no backend reachable, commands fail with a clear error — they never fake
+  success. See `scripts/e2e-setup.sh` for a local anvil + IPFS stack.
+- **Wallet at rest.** Always create wallets with `--password` (Argon2id + AES-256-GCM).
+  Without a password the private key and mnemonic are stored unencrypted (mode 0600) and
+  `init` prints a warning.
 
 ---
 
