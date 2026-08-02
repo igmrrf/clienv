@@ -36,6 +36,51 @@ pub struct IpfsPayload {
     pub content: String,
     pub content_key: String,
     pub ephemeral_pubkey: Option<String>,
+
+    // --- file-materialization metadata, all optional for backward compat ---
+    /// Intended file type of `content` (single-file secrets).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<SecretKind>,
+    /// Suggested output basename (single-file secrets).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    /// Seal: when true, refuse all file materialization (terminal view only).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_export: bool,
+    /// Present => this secret is a bundle; materialization iterates members.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members: Option<Vec<BundleMember>>,
+    /// Encoding of the single-file `content`: "utf8" (default) or "base64".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_encoding: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SecretKind {
+    Env,
+    Pem,
+    Json,
+    Cred,
+}
+
+fn enc_utf8() -> String {
+    "utf8".to_string()
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BundleMember {
+    pub kind: SecretKind,
+    /// Basename only, e.g. "creds.json".
+    pub filename: String,
+    /// The member's plaintext body (whole payload is still AEAD-encrypted at rest).
+    pub content: String,
+    /// "utf8" (default) or "base64" for binary member bodies.
+    #[serde(default = "enc_utf8")]
+    pub encoding: String,
+    /// Optional explicit env var name to bind this member's staged path to under `run`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
 }
 
 pub fn parse_duration(ttl_str: &str) -> Result<u64> {
@@ -173,6 +218,11 @@ pub fn share_secret(
         content: encrypted_content.clone(),
         content_key: encrypted_content_key.clone(),
         ephemeral_pubkey: Some(ephemeral_pub_hex.clone()),
+        kind: None,
+        filename: None,
+        no_export: false,
+        members: None,
+        content_encoding: None,
     };
     let payload_json = serde_json::to_string(&payload)?;
 
@@ -383,4 +433,85 @@ pub fn hide_secret(
     }
 
     Ok(hidden_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Backward compat: a payload serialized before this feature has only the three
+    // original fields. It MUST still deserialize, with new fields defaulting.
+    #[test]
+    fn old_payload_json_deserializes_with_defaults() {
+        let old_json = r#"{
+            "content": "nonce:cipher",
+            "content_key": "nonce:wrapped",
+            "ephemeral_pubkey": "0x04abcd"
+        }"#;
+        let p: IpfsPayload = serde_json::from_str(old_json).unwrap();
+        assert_eq!(p.content, "nonce:cipher");
+        assert_eq!(p.kind, None);
+        assert_eq!(p.filename, None);
+        assert!(!p.no_export);
+        assert!(p.members.is_none());
+        assert_eq!(p.content_encoding, None);
+    }
+
+    // A single-file secret with no new metadata omits every new field from the wire form,
+    // keeping bytes identical to a pre-feature payload.
+    #[test]
+    fn plain_payload_omits_all_new_fields() {
+        let p = IpfsPayload {
+            content: "c".to_string(),
+            content_key: "k".to_string(),
+            ephemeral_pubkey: Some("0x04".to_string()),
+            kind: None,
+            filename: None,
+            no_export: false,
+            members: None,
+            content_encoding: None,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains("kind"));
+        assert!(!json.contains("filename"));
+        assert!(!json.contains("no_export"));
+        assert!(!json.contains("members"));
+        assert!(!json.contains("content_encoding"));
+    }
+
+    // A bundle payload survives serialize -> deserialize intact.
+    #[test]
+    fn bundle_payload_roundtrips() {
+        let p = IpfsPayload {
+            content: String::new(),
+            content_key: "k".to_string(),
+            ephemeral_pubkey: None,
+            kind: None,
+            filename: None,
+            no_export: true,
+            members: Some(vec![BundleMember {
+                kind: SecretKind::Pem,
+                filename: "cert.pem".to_string(),
+                content: "LS0t".to_string(),
+                encoding: "base64".to_string(),
+                env: Some("TLS_CERT".to_string()),
+            }]),
+            content_encoding: None,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: IpfsPayload = serde_json::from_str(&json).unwrap();
+        assert!(back.no_export);
+        let m = back.members.unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].kind, SecretKind::Pem);
+        assert_eq!(m[0].filename, "cert.pem");
+        assert_eq!(m[0].encoding, "base64");
+        assert_eq!(m[0].env.as_deref(), Some("TLS_CERT"));
+    }
+
+    #[test]
+    fn secret_kind_serializes_lowercase() {
+        assert_eq!(serde_json::to_string(&SecretKind::Json).unwrap(), "\"json\"");
+        assert_eq!(serde_json::to_string(&SecretKind::Cred).unwrap(), "\"cred\"");
+    }
 }
