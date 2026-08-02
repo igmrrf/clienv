@@ -33,6 +33,13 @@ implementations and fixes the security/correctness findings from the code review
 - **Security model documented** in the README: confidentiality is cryptographic (AES-256-GCM +
   ECDH), but TTL / max-reads / revocation are advisory against a recipient who already fetched
   the payload; `--to public` provides no confidentiality.
+- **Public secrets are not read-limited.** `recordRead` previously let any caller inflate a
+  public secret's `readCount` and burn its `maxReads`, denying legitimate readers. Public
+  secrets are readable by anyone and cannot be meaningfully read-limited, so the contract no
+  longer enforces `maxReads`/authorization for them (the count is still tracked, informational);
+  the Rust view path guards the same way.
+- **Wallet plaintext zeroized on init.** The serialized wallet blob (plaintext private key +
+  mnemonic) is wrapped in `Zeroizing` so the encrypted path does not leave it in freed memory.
 
 ### Correctness
 
