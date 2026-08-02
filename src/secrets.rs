@@ -110,9 +110,12 @@ fn resolve_recipient_pubkey(to_address: &str, sender_info: &crate::wallet::Walle
             .map_err(|e| anyhow!("Invalid recipient public key: {}", e));
     }
 
-    Err(anyhow!(
-        "Recipient must be a valid SEC1 public key (0x04...), your own wallet address, or 'public'. EVM addresses (0x...) of external users cannot be used for ECDH key exchange without their public key."
-    ))
+    Err(crate::errors::BsecError::InvalidRecipient(
+        "Recipient must be a valid SEC1 public key (0x04...), your own wallet address, or 'public'. \
+         EVM addresses (0x...) of external users cannot be used for ECDH key exchange without their public key."
+            .into(),
+    )
+    .into())
 }
 
 pub fn share_secret(
@@ -230,7 +233,7 @@ pub fn view_secret(secret_id: &str, user_address: &str, password: Option<&str>) 
         || onchain_info.sender.to_lowercase() == user_address.to_lowercase();
 
     if !is_recipient && !is_sender {
-        return Err(anyhow!("You do not have permission to view this secret."));
+        return Err(crate::errors::BsecError::PermissionDenied("you may not view this secret".into()).into());
     }
 
     if onchain_info.revoked {
@@ -239,11 +242,11 @@ pub fn view_secret(secret_id: &str, user_address: &str, password: Option<&str>) 
 
     let now = crate::wallet::current_timestamp();
     if now > onchain_info.expires_at {
-        return Err(anyhow!("This secret has expired."));
+        return Err(crate::errors::BsecError::SecretExpired.into());
     }
 
     if onchain_info.read_count >= onchain_info.max_reads {
-        return Err(anyhow!("Maximum read count exceeded for this secret."));
+        return Err(crate::errors::BsecError::SecretExpired.into());
     }
 
     let payload_str = fetch_from_ipfs(&onchain_info.ipfs_cid)?;

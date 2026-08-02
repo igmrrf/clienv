@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use crate::errors::BsecError;
 use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Nonce};
@@ -203,7 +204,7 @@ pub fn decrypt_wallet(encrypted_str: &str, password: &str) -> Result<String> {
             .map_err(|_| anyhow!("Invalid ciphertext base64"))?;
         let plaintext = cipher
             .decrypt(nonce, cipher_text.as_ref())
-            .map_err(|_| anyhow!("Invalid password or corrupted wallet data"))?;
+            .map_err(|_| BsecError::InvalidPassword)?;
         let text_str = String::from_utf8(plaintext).map_err(|e| anyhow!("UTF8 decode error: {}", e))?;
         Ok(text_str)
     } else if parts.len() == 2 {
@@ -219,7 +220,7 @@ pub fn decrypt_wallet(encrypted_str: &str, password: &str) -> Result<String> {
             .map_err(|_| anyhow!("Invalid ciphertext base64"))?;
         let plaintext = cipher
             .decrypt(nonce, cipher_text.as_ref())
-            .map_err(|_| anyhow!("Invalid password or corrupted wallet data"))?;
+            .map_err(|_| BsecError::InvalidPassword)?;
         let text_str = String::from_utf8(plaintext).map_err(|e| anyhow!("UTF8 decode error: {}", e))?;
         Ok(text_str)
     } else {
@@ -253,7 +254,7 @@ pub fn init_wallet(
     let mnemonic_str = match import_mnemonic {
         Some(m) => {
             let _parsed = bip39::Mnemonic::parse(&m)
-                .map_err(|e| anyhow!("Invalid BIP-39 mnemonic phrase: {}", e))?;
+                .map_err(|e| BsecError::InvalidMnemonic(e.to_string()))?;
             m
         }
         None => generate_mnemonic()?,
@@ -340,7 +341,7 @@ pub fn get_wallet_info(password: Option<&str>) -> Result<WalletInfo> {
     let wallet_path = app_dir.join("wallet.json");
 
     if !wallet_path.exists() {
-        return Err(anyhow!("No wallet found. Please run 'bsec init' first."));
+        return Err(BsecError::WalletNotFound.into());
     }
 
     let content = fs::read_to_string(&wallet_path)?;
