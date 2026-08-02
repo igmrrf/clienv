@@ -4,22 +4,15 @@ use std::path::PathBuf;
 
 mod bip39_words;
 mod blockchain;
-mod config;
 mod env_file;
 mod errors;
 mod eth;
 mod helpers;
 mod ipfs;
-mod manager;
 mod network_config;
 mod project_config;
 mod secrets;
 mod wallet;
-
-#[cfg(test)]
-mod config_test;
-#[cfg(test)]
-mod manager_test;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -314,20 +307,6 @@ enum Commands {
         /// Target file path
         #[arg(short, long, default_value = ".env.local")]
         file: PathBuf,
-    },
-
-    /// Legacy / simple get command
-    Get {
-        /// Key name to retrieve
-        name: String,
-    },
-
-    /// Legacy / simple set command
-    Set {
-        /// Key name to set
-        name: String,
-        /// Value to assign
-        value: String,
     },
 
     /// Search for pattern in a file
@@ -803,20 +782,6 @@ fn main() {
             if let Err(e) = env_file::log_env_var(&env_name, &file) {
                 handle_cli_error("Error logging variable", e);
             }
-        }
-
-        Some(Commands::Get { name }) => {
-            let conf = config::get_config();
-            match manager::get_env_variable(&name, &conf.encryption_key) {
-                Some(value) => println!("{}: {}", name, value),
-                None => println!("environment variable not found"),
-            }
-        }
-
-        Some(Commands::Set { name, value }) => {
-            let conf = config::get_config();
-            manager::set_env_variable(&name, &value, &conf.encryption_key);
-            println!("environment variable set successfully");
         }
 
         Some(Commands::Search { name, path }) => {

@@ -1,9 +1,8 @@
 //! Network Configuration, Legacy Store, Shell Completion & CLI Utilities Integration Tests
 //!
-//! Target Modules: `src/network_config.rs`, `src/manager.rs`, `src/helpers.rs`, `src/errors.rs`, `src/main.rs`
+//! Target Modules: `src/network_config.rs`, `src/helpers.rs`, `src/errors.rs`, `src/main.rs`
 //! Flow Tested:
 //!   - Blockchain & storage network configuration management (`bsec config --network`, `--rpc`, `--show`)
-//!   - Legacy key-value storage (`bsec set`, `bsec get`)
 //!   - Substring pattern search within text files (`bsec search`)
 //!   - Shell completion generation (`bsec completion <shell>`) for bash, zsh, fish, powershell
 //!   - Help banner (`bsec --help`) & JSON format flags (`--json`)
@@ -48,56 +47,6 @@ fn test_network_config_flow() -> Result<(), Box<dyn std::error::Error>> {
         .success()
         .stdout(predicate::str::contains("Network: amoy"))
         .stdout(predicate::str::contains("Chain ID: 80002"));
-
-    Ok(())
-}
-
-/// Tests setting and retrieving variables in the legacy key-value store.
-/// Target File: `src/manager.rs` -> `set_env_variable()`, `get_env_variable()`
-/// Flow: `bsec set <key> <val>` -> `bsec get <key>`
-#[test]
-fn test_cli_set_and_get_var() -> Result<(), Box<dyn std::error::Error>> {
-    let temp_dir = assert_fs::TempDir::new()?;
-    let var_name = "TEST_CLI_VAR";
-    let var_value = "test_value_123";
-
-    // Set variable
-    let mut cmd_set = Command::cargo_bin("bsec")?;
-    cmd_set.current_dir(temp_dir.path());
-    cmd_set.env("BSEC_HOME", temp_dir.path());
-    cmd_set.arg("set").arg(var_name).arg(var_value);
-    cmd_set
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("environment variable set successfully"));
-
-    // Get variable
-    let mut cmd_get = Command::cargo_bin("bsec")?;
-    cmd_get.current_dir(temp_dir.path());
-    cmd_get.env("BSEC_HOME", temp_dir.path());
-    cmd_get.arg("get").arg(var_name);
-    cmd_get
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(var_value));
-
-    Ok(())
-}
-
-/// Tests getting a non-existent variable from the legacy key-value store.
-/// Target File: `src/manager.rs` -> `get_env_variable()`
-/// Flow: `bsec get NONEXISTENT_VAR`
-#[test]
-fn test_cli_get_nonexistent_var() -> Result<(), Box<dyn std::error::Error>> {
-    let temp_dir = assert_fs::TempDir::new()?;
-    let mut cmd = Command::cargo_bin("bsec")?;
-    cmd.current_dir(temp_dir.path());
-    cmd.env("BSEC_HOME", temp_dir.path());
-
-    cmd.arg("get").arg("NONEXISTENT_VAR");
-    cmd.assert()
-        .success()
-        .stdout(predicate::str::contains("environment variable not found"));
 
     Ok(())
 }
