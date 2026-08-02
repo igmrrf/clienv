@@ -172,14 +172,30 @@ pub fn share_secret(
 
     let is_public = to_address == "public";
 
+    // On-chain recipient is an EVM address: zero for public, else derived from the
+    // recipient's public key (real ECDH confidentiality is enforced separately).
+    let recipient_addr: [u8; 20] = if is_public {
+        [0u8; 20]
+    } else if let Some(ref pk) = recipient_pubkey_opt {
+        let ep = pk.to_encoded_point(false);
+        let hash = crate::blockchain::keccak256(&ep.as_bytes()[1..]);
+        let mut addr = [0u8; 20];
+        addr.copy_from_slice(&hash[12..32]);
+        addr
+    } else {
+        [0u8; 20]
+    };
+
+    let priv_bytes = Zeroizing::new(hex_to_bytes(&sender_info.private_key)?);
+
     register_secret_on_chain(
+        &priv_bytes,
         &secret_id,
-        to_address,
+        &recipient_addr,
         &ipfs_cid,
         expires_at,
         max_reads,
         is_public,
-        sender_address,
     )?;
 
     let record = SecretRecord {
@@ -271,7 +287,9 @@ pub fn view_secret(secret_id: &str, user_address: &str, password: Option<&str>) 
 
     let decrypted = decrypt_text(&payload.content, &key_bytes)?;
 
-    record_read_on_chain(secret_id)?;
+    let priv_bytes = Zeroizing::new(hex_to_bytes(&wallet_info.private_key)?);
+    record_read_on_chain(&priv_bytes, secret_id)?;
+    crate::blockchain::index_note(secret_id, "recipient");
 
     Ok(decrypted)
 }
@@ -314,11 +332,21 @@ pub fn list_secrets(
     Ok(results)
 }
 
-pub fn revoke_secret(secret_id: &str, user_address: &str) -> Result<()> {
-    revoke_secret_on_chain(secret_id, user_address)
+pub fn revoke_secret(secret_id: &str, password: Option<&str>) -> Result<()> {
+    let wallet_info = crate::wallet::get_wallet_info(password)?;
+    let priv_bytes = Zeroizing::new(hex_to_bytes(&wallet_info.private_key)?);
+    revoke_secret_on_chain(&priv_bytes, secret_id)
 }
 
-pub fn hide_secret(secret_id: Option<&str>, user_filter: Option<&str>, user_address: &str) -> Result<usize> {
+pub fn hide_secret(
+    secret_id: Option<&str>,
+    user_filter: Option<&str>,
+    user_address: &str,
+    password: Option<&str>,
+) -> Result<usize> {
+    let wallet_info = crate::wallet::get_wallet_info(password)?;
+    let priv_bytes = Zeroizing::new(hex_to_bytes(&wallet_info.private_key)?);
+
     let onchain_list = list_secrets_on_chain(user_address, user_filter, true, false, false)?;
     let mut hidden_count = 0;
 
@@ -330,10 +358,9 @@ pub fn hide_secret(secret_id: Option<&str>, user_filter: Option<&str>, user_addr
         });
 
         if matches_id && matches_filter {
-            // FAILSAFE DESIGN: Hiding a secret sets local visibility state (`hidden = true`).
-            // It also attempts best-effort on-chain revocation if the user is the creator.
-            // Any error during on-chain revocation is logged safely so local hiding succeeds.
-            if let Ok(()) = hide_secret_on_chain(&id, user_address) {
+            // Hiding sets local visibility (`hidden = true`) and best-effort revokes on-chain
+            // if this wallet is the creator; revocation failure is logged, local hide still applies.
+            if hide_secret_on_chain(&priv_bytes, &id).is_ok() {
                 hidden_count += 1;
             }
         }

@@ -7,6 +7,7 @@ mod blockchain;
 mod config;
 mod env_file;
 mod errors;
+mod eth;
 mod helpers;
 mod ipfs;
 mod manager;
@@ -67,6 +68,10 @@ enum Commands {
         /// Set custom RPC endpoint URL
         #[arg(long)]
         rpc: Option<String>,
+
+        /// Set deployed BsecSecretRegistry contract address
+        #[arg(long)]
+        registry: Option<String>,
 
         /// Set IPFS gateway URL
         #[arg(long)]
@@ -526,6 +531,7 @@ fn main() {
         Some(Commands::Config {
             network,
             rpc,
+            registry,
             ipfs_gateway,
             ipfs_pinning,
             show,
@@ -543,6 +549,7 @@ fn main() {
                     println!("Network: {}", conf.network);
                     println!("Chain ID: {}", conf.chain_id);
                     println!("RPC URL: {}", conf.rpc_url);
+                    println!("Registry: {}", conf.registry_address);
                     println!("IPFS Gateway: {}", conf.ipfs.gateway);
                     println!(
                         "IPFS Pinning Service: {}",
@@ -550,7 +557,7 @@ fn main() {
                     );
                 }
             } else {
-                match network_config::update_network_config(network, rpc, ipfs_gateway, ipfs_pinning) {
+                match network_config::update_network_config(network, rpc, registry, ipfs_gateway, ipfs_pinning) {
                     Ok(conf) => {
                         if json {
                             if let Ok(j) = serde_json::to_string_pretty(&conf) {
@@ -690,12 +697,7 @@ fn main() {
 
         Some(Commands::Revoke { secret_id, password }) => {
             let pwd = get_password_or_prompt(password, "Enter wallet password (if encrypted): ");
-            let user_addr = match wallet::get_wallet_info(pwd.as_deref()) {
-                Ok(w) => w.address.clone(),
-                Err(e) => handle_cli_error("Error loading wallet", e),
-            };
-
-            match secrets::revoke_secret(&secret_id, &user_addr) {
+            match secrets::revoke_secret(&secret_id, pwd.as_deref()) {
                 Ok(_) => println!("Secret '{}' has been revoked.", secret_id),
                 Err(e) => handle_cli_error("Error revoking secret", e),
             }
@@ -714,7 +716,7 @@ fn main() {
             };
 
             let target_id = if all { None } else { secret_id.as_deref() };
-            match secrets::hide_secret(target_id, user.as_deref(), &user_addr) {
+            match secrets::hide_secret(target_id, user.as_deref(), &user_addr, pwd.as_deref()) {
                 Ok(count) => println!("Hidden {} secret(s).", count),
                 Err(e) => handle_cli_error("Error hiding secret", e),
             }

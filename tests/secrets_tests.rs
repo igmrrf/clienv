@@ -12,11 +12,30 @@ use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use std::process::Command;
 
+/// Share/view/list/revoke flows now perform real on-chain transactions and IPFS I/O.
+/// They require a live RPC node (e.g. `docker compose up` anvil) with the registry contract
+/// deployed and the wallet funded, plus an IPFS backend. Skipped unless `BSEC_E2E=1`.
+fn e2e_enabled() -> bool {
+    std::env::var("BSEC_E2E").map(|v| v == "1").unwrap_or(false)
+}
+
+macro_rules! require_e2e {
+    () => {
+        if !e2e_enabled() {
+            eprintln!(
+                "SKIP: set BSEC_E2E=1 with anvil + IPFS running (see docker-compose.yml) to run this end-to-end test"
+            );
+            return Ok(());
+        }
+    };
+}
+
 /// Tests public secret sharing flow accessible without individual recipient keys.
 /// Target File: `src/secrets.rs` -> `share_secret()`, `view_secret()`
 /// Flow: `bsec share --to public --content ...` -> `bsec view <secret_id>`
 #[test]
 fn test_public_secret_sharing_flow() -> Result<(), Box<dyn std::error::Error>> {
+    require_e2e!();
     let temp_dir = assert_fs::TempDir::new()?;
 
     // 1. User A initializes wallet
@@ -70,6 +89,7 @@ fn test_public_secret_sharing_flow() -> Result<(), Box<dyn std::error::Error>> {
 /// Flow: Extract recipient public key -> `bsec share --to <pubkey>` -> `bsec view <secret_id>`
 #[test]
 fn test_ecdh_pubkey_secret_sharing_flow() -> Result<(), Box<dyn std::error::Error>> {
+    require_e2e!();
     let temp_dir = assert_fs::TempDir::new()?;
 
     // Initialize wallet
@@ -130,6 +150,7 @@ fn test_ecdh_pubkey_secret_sharing_flow() -> Result<(), Box<dyn std::error::Erro
 /// Flow: `bsec init --password` -> `bsec share --password` -> `bsec view --password`
 #[test]
 fn test_password_protected_wallet_secret_viewing() -> Result<(), Box<dyn std::error::Error>> {
+    require_e2e!();
     let temp_dir = assert_fs::TempDir::new()?;
 
     // 1. Initialize wallet with password "secret_pwd_123"
@@ -236,6 +257,7 @@ fn test_external_address_rejection_for_ecdh() -> Result<(), Box<dyn std::error::
 /// Flow: `bsec init` -> `bsec share` -> `bsec list` -> `bsec revoke` -> `bsec hide`
 #[test]
 fn test_wallet_and_secret_sharing_lifecycle_flow() -> Result<(), Box<dyn std::error::Error>> {
+    require_e2e!();
     let temp_dir = assert_fs::TempDir::new()?;
 
     // 1. Init wallet

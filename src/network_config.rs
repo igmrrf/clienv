@@ -7,6 +7,16 @@ use std::path::PathBuf;
 pub struct IpfsConfig {
     pub gateway: String,
     pub pinning_service: Option<String>,
+    /// Kubo RPC API endpoint (local daemon or self-hosted node).
+    #[serde(default = "default_ipfs_api_url")]
+    pub api_url: String,
+    /// Pinata JWT for hosted pinning. Falls back to the BSEC_PINATA_JWT env var.
+    #[serde(default)]
+    pub pinning_jwt: Option<String>,
+}
+
+fn default_ipfs_api_url() -> String {
+    "http://127.0.0.1:5001".to_string()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -28,6 +38,8 @@ impl Default for NetworkConfig {
             ipfs: IpfsConfig {
                 gateway: "https://ipfs.io/ipfs/".to_string(),
                 pinning_service: None,
+                api_url: default_ipfs_api_url(),
+                pinning_jwt: None,
             },
         }
     }
@@ -56,6 +68,7 @@ pub fn save_network_config(config: &NetworkConfig) -> Result<()> {
 pub fn update_network_config(
     network: Option<String>,
     rpc: Option<String>,
+    registry: Option<String>,
     ipfs_gateway: Option<String>,
     ipfs_pinning: Option<String>,
 ) -> Result<NetworkConfig> {
@@ -120,6 +133,10 @@ pub fn update_network_config(
 
     if let Some(r) = rpc {
         config.rpc_url = r;
+    }
+
+    if let Some(reg) = registry {
+        config.registry_address = reg;
     }
 
     if let Some(g) = ipfs_gateway {
