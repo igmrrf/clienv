@@ -281,6 +281,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "dirs",
+ "hkdf",
  "k256",
  "lazy_static",
  "log",

@@ -59,6 +59,16 @@ pub fn parse_duration(ttl_str: &str) -> Result<u64> {
     }
 }
 
+/// Derive an AES-256 wrapper key from a raw ECDH shared secret using HKDF-SHA256 with a
+/// fixed domain-separation label, instead of a bare SHA-256 of the shared X coordinate.
+fn derive_ecdh_key(shared_secret: &[u8]) -> Result<[u8; 32]> {
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, shared_secret);
+    let mut okm = [0u8; 32];
+    hk.expand(b"bsec-ecdh-aes256gcm-v1", &mut okm)
+        .map_err(|_| anyhow!("HKDF key derivation failed"))?;
+    Ok(okm)
+}
+
 fn encrypt_text(plain: &str, key_bytes: &[u8; 32]) -> Result<String> {
     let cipher = Aes256Gcm::new_from_slice(key_bytes).map_err(|_| anyhow!("key init failed"))?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
@@ -148,7 +158,7 @@ pub fn share_secret(
             ephemeral_secret.to_nonzero_scalar(),
             recipient_pubkey.as_affine(),
         );
-        hash_digest(shared_secret.raw_secret_bytes())
+        derive_ecdh_key(shared_secret.raw_secret_bytes())?
     } else {
         return Err(anyhow!("Cannot resolve recipient public key for encryption."));
     };
@@ -269,7 +279,7 @@ pub fn view_secret(secret_id: &str, user_address: &str, password: Option<&str>) 
             secret_key.to_nonzero_scalar(),
             eph_public.as_affine(),
         );
-        hash_digest(shared_secret.raw_secret_bytes())
+        derive_ecdh_key(shared_secret.raw_secret_bytes())?
     } else {
         return Err(anyhow!("Corrupted secret payload: missing ephemeral public key"));
     };
