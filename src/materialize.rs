@@ -424,6 +424,7 @@ impl StagedDir {
         Ok(Self { path })
     }
 
+    #[allow(dead_code)] // part of the documented API; used in tests and by future callers
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -470,8 +471,9 @@ fn install_signal_cleanup() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| unsafe {
-        libc::signal(libc::SIGINT, signal_cleanup_handler as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, signal_cleanup_handler as libc::sighandler_t);
+        let handler = signal_cleanup_handler as *const () as libc::sighandler_t;
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
     });
 }
 

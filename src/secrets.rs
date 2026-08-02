@@ -6,7 +6,6 @@ use base64::prelude::*;
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use zeroize::Zeroizing;
 
 use crate::blockchain::{
@@ -325,6 +324,7 @@ pub fn share_secret(
     Ok(record)
 }
 
+#[allow(dead_code)] // retained flatten-to-string API; view now goes through view_payload
 pub fn view_secret(secret_id: &str, user_address: &str, password: Option<&str>) -> Result<String> {
     Ok(view_payload(secret_id, user_address, password)?.content)
 }
@@ -434,15 +434,6 @@ pub fn view_payload(secret_id: &str, user_address: &str, password: Option<&str>)
         members: decrypted_members,
         content_encoding: payload.content_encoding,
     })
-}
-
-pub fn load_secret_as_env(secret_id: &str, user_address: &str, password: Option<&str>) -> Result<BTreeMap<String, String>> {
-    let decrypted_content = view_secret(secret_id, user_address, password)?;
-    if decrypted_content.trim().starts_with('{') {
-        crate::env_file::parse_json_content(&decrypted_content)
-    } else {
-        Ok(crate::env_file::parse_env_content(&decrypted_content))
-    }
 }
 
 pub fn list_secrets(
