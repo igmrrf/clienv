@@ -301,10 +301,12 @@ pub fn init_wallet(
         user_id: user_id.clone(),
     };
 
-    let raw_data = serde_json::to_string(&wallet_info)?;
+    // Zeroizing: the serialized blob contains the plaintext private key and mnemonic. Wiping it
+    // after use keeps the encrypted path from leaving the plaintext lingering in freed memory.
+    let raw_data = Zeroizing::new(serde_json::to_string(&wallet_info)?);
 
     let wallet_file = if let Some(ref pwd) = password {
-        let encrypted_data = encrypt_wallet(&raw_data, pwd)?;
+        let encrypted_data = encrypt_wallet(raw_data.as_str(), pwd)?;
         WalletFile {
             encrypted: true,
             data: encrypted_data,
@@ -319,7 +321,7 @@ pub fn init_wallet(
         );
         WalletFile {
             encrypted: false,
-            data: raw_data,
+            data: raw_data.as_str().to_string(),
             last_accessed: now,
         }
     };
