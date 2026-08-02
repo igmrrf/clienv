@@ -102,10 +102,17 @@ contract BsecSecretRegistry {
         if (record.sender == address(0)) revert SecretNotFound(secretId);
         if (record.revoked) revert SecretIsRevoked(secretId);
         if (block.timestamp > record.expiresAt) revert SecretExpired(secretId, record.expiresAt, uint64(block.timestamp));
-        if (record.readCount >= record.maxReads) revert ReadLimitExceeded(secretId, record.readCount, record.maxReads);
 
-        if (!record.isPublic && msg.sender != record.recipient && msg.sender != record.sender) {
-            revert UnauthorizedViewer(secretId, msg.sender);
+        // Public secrets are readable by anyone and are NOT read-limited: enforcing maxReads
+        // here would let any caller burn the limit and deny legitimate readers (griefing).
+        // Read limits and viewer authorization apply only to non-public secrets.
+        if (!record.isPublic) {
+            if (record.readCount >= record.maxReads) {
+                revert ReadLimitExceeded(secretId, record.readCount, record.maxReads);
+            }
+            if (msg.sender != record.recipient && msg.sender != record.sender) {
+                revert UnauthorizedViewer(secretId, msg.sender);
+            }
         }
 
         record.readCount += 1;
@@ -147,7 +154,8 @@ contract BsecSecretRegistry {
         if (record.sender == address(0)) revert SecretNotFound(secretId);
 
         bool expired = block.timestamp > record.expiresAt;
-        bool limitExceeded = record.readCount >= record.maxReads;
+        // Public secrets are not read-limited (see recordRead).
+        bool limitExceeded = !record.isPublic && record.readCount >= record.maxReads;
 
         return (
             record.sender,

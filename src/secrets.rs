@@ -257,7 +257,8 @@ pub fn view_secret(secret_id: &str, user_address: &str, password: Option<&str>) 
         return Err(crate::errors::BsecError::SecretExpired.into());
     }
 
-    if onchain_info.read_count >= onchain_info.max_reads {
+    // Public secrets are not read-limited (the contract does not enforce maxReads for them).
+    if !onchain_info.is_public && onchain_info.read_count >= onchain_info.max_reads {
         return Err(crate::errors::BsecError::SecretExpired.into());
     }
 
