@@ -12,9 +12,12 @@ use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use std::process::Command;
 
-/// Share/view/list/revoke flows now perform real on-chain transactions and IPFS I/O.
-/// They require a live RPC node (e.g. `docker compose up` anvil) with the registry contract
-/// deployed and the wallet funded, plus an IPFS backend. Skipped unless `BSEC_E2E=1`.
+/// Share/view/list/revoke flows now perform real on-chain transactions and IPFS I/O, so these
+/// illustrative CLI checks require a deployed registry, a funded wallet, and an IPFS backend.
+/// The primary end-to-end verification is `scripts/e2e-setup.sh` followed by driving the CLI
+/// (it provisions and funds a single wallet sequentially, avoiding nonce races). These tests
+/// each use an isolated `BSEC_HOME`, so running them live also needs per-home funding and
+/// `--test-threads=1`. Skipped unless `BSEC_E2E=1`.
 fn e2e_enabled() -> bool {
     std::env::var("BSEC_E2E").map(|v| v == "1").unwrap_or(false)
 }
@@ -23,7 +26,8 @@ macro_rules! require_e2e {
     () => {
         if !e2e_enabled() {
             eprintln!(
-                "SKIP: set BSEC_E2E=1 with anvil + IPFS running (see docker-compose.yml) to run this end-to-end test"
+                "SKIP: on-chain e2e. Use scripts/e2e-setup.sh to provision anvil + IPFS + a funded \
+                 wallet, then set BSEC_E2E=1 (run with --test-threads=1)."
             );
             return Ok(());
         }
