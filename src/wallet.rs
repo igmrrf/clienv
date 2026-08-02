@@ -263,24 +263,17 @@ pub fn init_wallet(
         .map_err(|e| anyhow!("Failed to parse mnemonic: {}", e))?;
     let seed = parsed_mnemonic.to_seed("");
 
+    // Standard BIP-44 Ethereum path. Any derivation failure is a hard error: silently
+    // falling back to a raw seed slice would produce a DIFFERENT (non-standard) key/address
+    // than the mnemonic implies, stranding funds and making secrets un-decryptable.
     let derivation_path = "m/44'/60'/0'/0/0";
-    let secret_key = if let Ok(path) = derivation_path.parse::<bip32::DerivationPath>() {
-        if let Ok(xprv) = bip32::XPrv::derive_from_path(seed, &path) {
-            k256::SecretKey::from_slice(&xprv.private_key().to_bytes())
-                .map_err(|e| anyhow!("Failed to derive Secp256k1 key: {}", e))?
-        } else {
-            // FAILSAFE DESIGN: If BIP-32 HD path derivation fails, fall back to using the raw 32-byte seed slice
-            // as a failsafe so wallet initialization never leaves the user stranded.
-            log::warn!("BIP-32 HD derivation failed for path {}; falling back to raw seed slice.", derivation_path);
-            k256::SecretKey::from_slice(&seed[0..32])
-                .map_err(|e| anyhow!("Failed to derive Secp256k1 secret key: {}", e))?
-        }
-    } else {
-        // FAILSAFE DESIGN: Fallback for invalid derivation path syntax.
-        log::warn!("Derivation path parse error; falling back to raw seed slice.");
-        k256::SecretKey::from_slice(&seed[0..32])
-            .map_err(|e| anyhow!("Failed to derive Secp256k1 secret key: {}", e))?
-    };
+    let path = derivation_path
+        .parse::<bip32::DerivationPath>()
+        .map_err(|e| anyhow!("Invalid derivation path '{}': {}", derivation_path, e))?;
+    let xprv = bip32::XPrv::derive_from_path(seed, &path)
+        .map_err(|e| anyhow!("BIP-32 HD key derivation failed for path {}: {}", derivation_path, e))?;
+    let secret_key = k256::SecretKey::from_slice(&xprv.private_key().to_bytes())
+        .map_err(|e| anyhow!("Failed to derive secp256k1 key: {}", e))?;
 
     let public_key = secret_key.public_key();
 
@@ -317,6 +310,12 @@ pub fn init_wallet(
             last_accessed: now,
         }
     } else {
+        eprintln!(
+            "WARNING: wallet created WITHOUT a password. The private key and mnemonic are stored \
+             UNENCRYPTED at {}. Anyone with read access to this file controls the wallet. \
+             Re-run with --password to encrypt it.",
+            wallet_path.display()
+        );
         WalletFile {
             encrypted: false,
             data: raw_data,
