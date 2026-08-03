@@ -34,6 +34,59 @@ macro_rules! require_e2e {
     };
 }
 
+/// Configure `home` for the local e2e stack and fund its wallet from anvil's unlocked account.
+/// Connection details come from env so CI can inject them: BSEC_E2E_RPC (default
+/// http://localhost:8545), BSEC_E2E_REGISTRY (required), BSEC_E2E_IPFS_GATEWAY
+/// (default http://localhost:8080/ipfs/), BSEC_E2E_FUNDER (default anvil account #0).
+fn provision_local(home: &std::path::Path, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let rpc = std::env::var("BSEC_E2E_RPC").unwrap_or_else(|_| "http://localhost:8545".to_string());
+    let registry = std::env::var("BSEC_E2E_REGISTRY")
+        .expect("BSEC_E2E_REGISTRY must be set for e2e (the deployed BsecSecretRegistry address)");
+    let gateway = std::env::var("BSEC_E2E_IPFS_GATEWAY")
+        .unwrap_or_else(|_| "http://localhost:8080/ipfs/".to_string());
+    let funder = std::env::var("BSEC_E2E_FUNDER")
+        .unwrap_or_else(|_| "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".to_string());
+
+    let mut cfg = Command::cargo_bin("bsec")?;
+    cfg.current_dir(home).env("BSEC_HOME", home);
+    cfg.args([
+        "config", "--network", "local", "--rpc", &rpc, "--registry", &registry,
+        "--ipfs-gateway", &gateway,
+    ]);
+    cfg.assert().success();
+
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"eth_sendTransaction","params":[{{"from":"{}","to":"{}","value":"0x8ac7230489e80000"}}]}}"#,
+        funder, addr
+    );
+    let out = Command::new("curl")
+        .args(["-s", "-X", "POST", &rpc, "-H", "content-type: application/json", "-d", &body])
+        .output()?;
+    assert!(out.status.success(), "funding RPC call failed");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    Ok(())
+}
+
+/// Init an unencrypted wallet in `home`; under e2e, also point it at the local stack and fund it.
+/// Returns the init stdout so callers can parse the address / public key.
+fn init_and_provision(home: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
+    let mut cmd = Command::cargo_bin("bsec")?;
+    cmd.current_dir(home).env("BSEC_HOME", home);
+    cmd.arg("init").arg("--overwrite").arg("--no-encryption");
+    let out = cmd.output()?;
+    assert!(out.status.success(), "wallet init failed");
+    let stdout = String::from_utf8(out.stdout)?;
+    if e2e_enabled() {
+        let addr = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("Address: "))
+            .map(|s| s.trim().to_string())
+            .expect("init output should contain the wallet address");
+        provision_local(home, &addr)?;
+    }
+    Ok(stdout)
+}
+
 /// Tests public secret sharing flow accessible without individual recipient keys.
 /// Target File: `src/secrets.rs` -> `share_secret()`, `view_secret()`
 /// Flow: `bsec share --to public --content ...` -> `bsec view <secret_id>`
@@ -42,12 +95,8 @@ fn test_public_secret_sharing_flow() -> Result<(), Box<dyn std::error::Error>> {
     require_e2e!();
     let temp_dir = assert_fs::TempDir::new()?;
 
-    // 1. User A initializes wallet
-    let mut cmd_init = Command::cargo_bin("bsec")?;
-    cmd_init.current_dir(temp_dir.path());
-    cmd_init.env("BSEC_HOME", temp_dir.path());
-    cmd_init.arg("init").arg("--overwrite");
-    cmd_init.assert().success();
+    // 1. User A initializes wallet (and, under e2e, points it at the local stack + funds it)
+    init_and_provision(temp_dir.path())?;
 
     // 2. User A shares a public secret
     let mut cmd_share = Command::cargo_bin("bsec")?;
@@ -96,13 +145,8 @@ fn test_ecdh_pubkey_secret_sharing_flow() -> Result<(), Box<dyn std::error::Erro
     require_e2e!();
     let temp_dir = assert_fs::TempDir::new()?;
 
-    // Initialize wallet
-    let mut cmd_init = Command::cargo_bin("bsec")?;
-    cmd_init.current_dir(temp_dir.path());
-    cmd_init.env("BSEC_HOME", temp_dir.path());
-    cmd_init.arg("init").arg("--overwrite");
-    let assert_init = cmd_init.assert().success();
-    let stdout_init = String::from_utf8(assert_init.get_output().stdout.clone())?;
+    // Initialize wallet (and, under e2e, point it at the local stack + fund it)
+    let stdout_init = init_and_provision(temp_dir.path())?;
 
     let mut pubkey = String::new();
     for line in stdout_init.lines() {
@@ -183,6 +227,9 @@ fn test_password_protected_wallet_secret_viewing() -> Result<(), Box<dyn std::er
         }
     }
 
+    // Point this (encrypted) wallet's home at the local stack and fund it before it transacts.
+    provision_local(temp_dir.path(), &wallet_addr)?;
+
     let mut cmd_share = Command::cargo_bin("bsec")?;
     cmd_share.current_dir(temp_dir.path());
     cmd_share.env("BSEC_HOME", temp_dir.path());
@@ -235,7 +282,7 @@ fn test_external_address_rejection_for_ecdh() -> Result<(), Box<dyn std::error::
     let mut cmd_init = Command::cargo_bin("bsec")?;
     cmd_init.current_dir(temp_dir.path());
     cmd_init.env("BSEC_HOME", temp_dir.path());
-    cmd_init.arg("init").arg("--overwrite");
+    cmd_init.arg("init").arg("--overwrite").arg("--no-encryption");
     cmd_init.assert().success();
 
     let external_addr = "0x1111222233334444555566667777888899990000";
@@ -264,12 +311,8 @@ fn test_wallet_and_secret_sharing_lifecycle_flow() -> Result<(), Box<dyn std::er
     require_e2e!();
     let temp_dir = assert_fs::TempDir::new()?;
 
-    // 1. Init wallet
-    let mut cmd_init = Command::cargo_bin("bsec")?;
-    cmd_init.current_dir(temp_dir.path());
-    cmd_init.env("BSEC_HOME", temp_dir.path());
-    cmd_init.arg("init").arg("--overwrite");
-    cmd_init.assert().success();
+    // 1. Init wallet (and, under e2e, point it at the local stack + fund it)
+    init_and_provision(temp_dir.path())?;
 
     // 2. Share secret
     let mut cmd_share = Command::cargo_bin("bsec")?;

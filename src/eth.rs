@@ -606,4 +606,104 @@ mod tests {
             "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf"
         );
     }
+
+    #[test]
+    fn hex_to_u128_cases() {
+        // Standard 0x-prefixed and bare hex.
+        assert_eq!(hex_to_u128("0x10").unwrap(), 16);
+        assert_eq!(hex_to_u128("ff").unwrap(), 255);
+        // Empty and lone "0x" are treated as zero.
+        assert_eq!(hex_to_u128("").unwrap(), 0);
+        assert_eq!(hex_to_u128("0x").unwrap(), 0);
+        // Surrounding whitespace is trimmed before parsing.
+        assert_eq!(hex_to_u128("  0x10  ").unwrap(), 16);
+        // Non-hex digits surface as an error.
+        assert!(hex_to_u128("0xZZ").is_err());
+    }
+
+    #[test]
+    fn legacy_tx_structural_and_deterministic() {
+        use crate::wallet::hex_to_bytes;
+        let mut pk = [0u8; 32];
+        pk[31] = 1;
+        let to = [0x11u8; 20];
+        let raw1 = sign_legacy_tx(&pk, 0, 1_000_000_000, 21000, &to, 0, b"", 1).unwrap();
+        let raw2 = sign_legacy_tx(&pk, 0, 1_000_000_000, 21000, &to, 0, b"", 1).unwrap();
+
+        // (a) 0x-prefixed raw tx.
+        assert!(raw1.starts_with("0x"));
+        // (b) RFC6979 deterministic signing -> identical inputs, identical output.
+        assert_eq!(raw1, raw2);
+        // (c) NOT an EIP-1559 type-2 envelope; a legacy RLP list starts with a byte
+        // >= 0xc0, so the first hex char after 0x is in c/d/e/f.
+        assert!(!raw1.starts_with("0x02"));
+        let first = raw1.as_bytes()[2] as char;
+        assert!(matches!(first, 'c' | 'd' | 'e' | 'f'));
+        // (d) Even-length body that round-trips through the crate's hex decoder.
+        let body = &raw1[2..];
+        assert_eq!(body.len() % 2, 0);
+        assert!(hex_to_bytes(body).is_ok());
+    }
+
+    #[test]
+    fn decode_secret_info_roundtrip() {
+        // Push a right-aligned 32-byte word carrying a big-endian integer.
+        fn push_word_u128(buf: &mut Vec<u8>, v: u128) {
+            let mut w = [0u8; 32];
+            w[16..32].copy_from_slice(&v.to_be_bytes());
+            buf.extend_from_slice(&w);
+        }
+        // Push a bool as a right-aligned word (non-zero in the last 8 bytes).
+        fn push_word_bool(buf: &mut Vec<u8>, b: bool) {
+            push_word_u128(buf, if b { 1 } else { 0 });
+        }
+        // Push an address into the low 20 bytes (bytes 12..32) of a word.
+        fn push_word_addr(buf: &mut Vec<u8>, addr: &[u8; 20]) {
+            let mut w = [0u8; 32];
+            w[12..32].copy_from_slice(addr);
+            buf.extend_from_slice(&w);
+        }
+
+        let sender = [0xAAu8; 20];
+        let recipient = [0xBBu8; 20];
+        let cid = "QmTestCid123";
+
+        let mut buf: Vec<u8> = Vec::new();
+        push_word_addr(&mut buf, &sender); // word 0
+        push_word_addr(&mut buf, &recipient); // word 1
+        push_word_u128(&mut buf, 11 * 32); // word 2: string tail offset = 352
+        push_word_u128(&mut buf, 1000); // word 3: created_at
+        push_word_u128(&mut buf, 2000); // word 4: expires_at
+        push_word_u128(&mut buf, 5); // word 5: max_reads
+        push_word_u128(&mut buf, 2); // word 6: read_count
+        push_word_bool(&mut buf, false); // word 7: revoked
+        push_word_bool(&mut buf, true); // word 8: is_public
+        push_word_bool(&mut buf, false); // word 9: is_expired
+        push_word_bool(&mut buf, false); // word 10: limit_reached
+        assert_eq!(buf.len(), 11 * 32);
+
+        // Dynamic string tail at offset 352: length word, then padded CID bytes.
+        push_word_u128(&mut buf, cid.len() as u128);
+        buf.extend_from_slice(cid.as_bytes());
+        let pad = (32 - (cid.len() % 32)) % 32;
+        buf.extend(std::iter::repeat_n(0u8, pad));
+
+        let d = decode_secret_info(&buf).unwrap();
+        assert_eq!(d.sender, sender);
+        assert_eq!(d.recipient, recipient);
+        assert_eq!(d.ipfs_cid, cid);
+        assert_eq!(d.created_at, 1000);
+        assert_eq!(d.expires_at, 2000);
+        assert_eq!(d.max_reads, 5);
+        assert_eq!(d.read_count, 2);
+        assert!(!d.revoked);
+        assert!(d.is_public);
+        assert!(!d.is_expired);
+        assert!(!d.limit_reached);
+    }
+
+    #[test]
+    fn decode_secret_info_rejects_short_buffer() {
+        assert!(decode_secret_info(&[0u8; 100]).is_err());
+    }
 }

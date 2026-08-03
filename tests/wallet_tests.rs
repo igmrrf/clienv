@@ -25,7 +25,8 @@ fn test_wallet_init_mnemonic() -> Result<(), Box<dyn std::error::Error>> {
     cmd.arg("init")
         .arg("--import-mnemonic")
         .arg(mnemonic)
-        .arg("--overwrite");
+        .arg("--overwrite")
+        .arg("--no-encryption");
 
     cmd.assert()
         .success()
@@ -112,7 +113,8 @@ fn test_wallet_export_command() -> Result<(), Box<dyn std::error::Error>> {
     cmd_init.env("BSEC_HOME", temp_dir.path());
     cmd_init
         .arg("init")
-        .arg("--overwrite");
+        .arg("--overwrite")
+        .arg("--no-encryption");
     cmd_init.assert().success();
 
     let mut cmd_export = Command::cargo_bin("bsec")?;

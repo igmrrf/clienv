@@ -144,7 +144,9 @@ pub fn convert_env_file(
         }
     };
 
-    fs::write(output_file, output_str)?;
+    // Output carries actual secret values; write via the hardened writer (mode 0600,
+    // O_NOFOLLOW) so it is never world/group readable and cannot be redirected via a symlink.
+    write_secure_file(output_file, output_str.as_bytes())?;
     Ok(())
 }
 
@@ -162,7 +164,9 @@ pub fn validate_env_file(schema_path: &Path, env_path: &Path) -> Result<()> {
         for k in schema_map.keys() {
             lines.push(format!("{}=", k));
         }
-        fs::write(env_path, lines.join("\n"))?;
+        // Derived from an env file; use the hardened writer (mode 0600, O_NOFOLLOW) so any
+        // future secret values live in a file that is never group/world readable.
+        write_secure_file(env_path, lines.join("\n").as_bytes())?;
         println!("Environment file created successfully.");
         return Ok(());
     }
@@ -191,7 +195,9 @@ pub fn validate_env_file(schema_path: &Path, env_path: &Path) -> Result<()> {
         for key in missing_keys {
             new_lines.push(format!("{}=", key));
         }
-        fs::write(env_path, new_lines.join("\n"))?;
+        // Rewrites the existing .env with its real values plus appended keys; use the
+        // hardened writer (mode 0600, O_NOFOLLOW) to preserve restrictive perms and reject symlinks.
+        write_secure_file(env_path, new_lines.join("\n").as_bytes())?;
         println!("Updated '{}' with missing keys.", env_path.display());
     } else {
         println!("Environment file '{}' is valid and matches schema.", env_path.display());
@@ -209,7 +215,9 @@ pub fn generate_template(env_path: &Path, output_path: &Path) -> Result<()> {
         lines.push(format!("{}=#Your {} here", k, k));
     }
 
-    fs::write(output_path, lines.join("\n"))?;
+    // Derived from an env file; route through the hardened writer (mode 0600, O_NOFOLLOW)
+    // so anything produced from env-file contents keeps restrictive perms and rejects symlinks.
+    write_secure_file(output_path, lines.join("\n").as_bytes())?;
     Ok(())
 }
 
@@ -389,6 +397,57 @@ pub fn load_and_parse_env(env_path: &Path, password: Option<&str>) -> Result<BTr
     }
 }
 
+/// Environment variable names that must never be injected into the child from a shared
+/// secret or env file. These alter the dynamic loader, the command search path, or the
+/// shell/interpreter startup, and would let attacker-controlled secret content achieve
+/// code execution in the `run` child (CWE-426 / CWE-427 / CWE-88).
+const BLOCKED_ENV_NAMES: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "LD_ORIGIN_PATH",
+    "LD_CONFIG",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "PATH",
+    "IFS",
+    "BASH_ENV",
+    "ENV",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "PROMPT_COMMAND",
+    "PS4",
+    "GLOBIGNORE",
+    "NODE_OPTIONS",
+    "PYTHONSTARTUP",
+    "PYTHONPATH",
+    "PERL5OPT",
+    "PERL5LIB",
+    "RUBYOPT",
+    "RUBYLIB",
+    "GIT_SSH_COMMAND",
+];
+
+/// Accept only conventional, safe environment variable names: non-empty, `[A-Za-z_][A-Za-z0-9_]*`,
+/// not on the loader/interpreter block-list (case-insensitive). Reject everything else so a
+/// shared secret cannot smuggle a hijacking variable into the child process.
+fn safe_env_name(k: &str) -> bool {
+    if k.is_empty() {
+        return false;
+    }
+    let bytes = k.as_bytes();
+    if bytes[0].is_ascii_digit() {
+        return false;
+    }
+    if !bytes.iter().all(|&b| b == b'_' || b.is_ascii_alphanumeric()) {
+        return false;
+    }
+    let upper = k.to_ascii_uppercase();
+    !BLOCKED_ENV_NAMES.contains(&upper.as_str())
+}
+
 pub fn run_with_envs(
     env_file: Option<&Path>,
     secret_id: Option<&str>,
@@ -443,11 +502,15 @@ pub fn run_with_envs(
     } else if target_secret_id.is_none() {
         let default_local = Path::new(".env.local");
         if default_local.exists() {
+            // Surface the implicit load so it is obvious in an untrusted working directory.
+            eprintln!("Note: auto-loaded environment from {} in the current directory", default_local.display());
             let file_vars = load_and_parse_env(default_local, password)?;
             env_map.extend(file_vars);
         } else {
             let default_env = Path::new(".env");
             if default_env.exists() {
+                // Surface the implicit load so it is obvious in an untrusted working directory.
+                eprintln!("Note: auto-loaded environment from {} in the current directory", default_env.display());
                 let file_vars = load_and_parse_env(default_env, password)?;
                 env_map.extend(file_vars);
             }
@@ -457,7 +520,24 @@ pub fn run_with_envs(
     let mut child = Command::new(&command_and_args[0]);
     child.args(&command_and_args[1..]);
 
+    // Inject env vars, refusing any name that could hijack the child (loader/PATH/shell
+    // startup). Secret content is attacker-controlled when the secret came from another
+    // party, so this is the trust boundary between shared data and process execution.
     for (k, v) in env_map {
+        if !safe_env_name(&k) {
+            return Err(anyhow!(
+                "refusing to inject unsafe environment variable name {:?} from secret/env file",
+                k
+            ));
+        }
+        // A key or value with an interior NUL byte would otherwise fail at spawn with an
+        // opaque OS error; reject it explicitly so the offending variable is named.
+        if k.contains('\0') || v.contains('\0') {
+            return Err(anyhow!(
+                "refusing to inject environment variable {:?} whose value contains a NUL byte",
+                k
+            ));
+        }
         child.env(k, v);
     }
 
@@ -480,5 +560,35 @@ pub fn run_with_envs(
     #[cfg(not(unix))]
     {
         Ok(status.code().unwrap_or(1))
+    }
+}
+
+#[cfg(test)]
+mod env_name_tests {
+    use super::safe_env_name;
+
+    #[test]
+    fn accepts_conventional_names() {
+        for ok in ["DB_URL", "API_KEY", "_PRIVATE", "PORT", "A1_B2", "GOOGLE_APPLICATION_CREDENTIALS"] {
+            assert!(safe_env_name(ok), "should accept {:?}", ok);
+        }
+    }
+
+    #[test]
+    fn rejects_loader_and_shell_hijack_names() {
+        for bad in [
+            "LD_PRELOAD", "ld_preload", "Ld_Preload", "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES", "PATH", "path", "BASH_ENV", "ENV",
+            "PROMPT_COMMAND", "NODE_OPTIONS", "PYTHONSTARTUP", "IFS", "GIT_SSH_COMMAND",
+        ] {
+            assert!(!safe_env_name(bad), "should reject {:?}", bad);
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_names() {
+        for bad in ["", "1ABC", "A-B", "A B", "A=B", "A.B", "A/B", "A\0B", "FÖÖ"] {
+            assert!(!safe_env_name(bad), "should reject {:?}", bad);
+        }
     }
 }

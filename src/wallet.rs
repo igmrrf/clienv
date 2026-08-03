@@ -100,17 +100,51 @@ pub fn write_secure_file(path: &Path, content: &[u8]) -> Result<()> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         use std::io::Write;
+        // O_NOFOLLOW: refuse to open the final path component if it is a symlink. Without this
+        // an attacker who can plant a symlink at the target between an existence check and the
+        // write (TOCTOU, CWE-59/CWE-367) could redirect a plaintext-secret write elsewhere, or
+        // clobber a victim-owned file. Opening a symlink now fails with ELOOP instead.
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)?;
         file.write_all(content)?;
     }
     #[cfg(not(unix))]
     {
         fs::write(path, content)?;
+    }
+    set_private_file_permissions(path);
+    Ok(())
+}
+
+/// Like `write_secure_file` but fails (AlreadyExists) if the path already exists.
+/// O_EXCL (via `create_new`) makes the "do not overwrite" decision atomic (no TOCTOU,
+/// CWE-367): an existence check followed by a separate open can race a planted file, but a
+/// single exclusive-create open cannot. O_NOFOLLOW still refuses a symlink at the final
+/// component. Use this for the non-force write path; `write_secure_file` (create+truncate)
+/// remains for the force path and all existing callers.
+pub fn write_secure_file_new(path: &Path, content: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        file.write_all(content)?;
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+        file.write_all(content)?;
     }
     set_private_file_permissions(path);
     Ok(())
@@ -283,7 +317,18 @@ pub fn init_wallet(
     password: Option<String>,
     user_id: Option<String>,
     overwrite: bool,
+    allow_plaintext: bool,
 ) -> Result<WalletInfo> {
+    // Encryption is the default. Storing the private key and mnemonic in cleartext (CWE-312)
+    // is only permitted when the caller explicitly opts in via `allow_plaintext`; otherwise a
+    // missing password is a hard error rather than a silent plaintext write.
+    if password.is_none() && !allow_plaintext {
+        return Err(anyhow!(
+            "A wallet password is required to encrypt the private key and mnemonic at rest. \
+             Provide one interactively or via --password, or pass --no-encryption to explicitly \
+             store the wallet UNENCRYPTED (not recommended)."
+        ));
+    }
     let app_dir = get_app_dir();
     let config_path = app_dir.join("config.json");
     let wallet_path = app_dir.join("wallet.json");
@@ -407,4 +452,71 @@ pub fn get_wallet_info(password: Option<&str>) -> Result<WalletInfo> {
     };
 
     Ok(info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_secure_file_new_creates_0600_then_refuses_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("secret");
+
+        write_secure_file_new(&p, b"data").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"data");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+
+        // Exclusive create (O_EXCL): a second write to the same path must fail with
+        // AlreadyExists, atomically — never a silent truncating overwrite.
+        let err = write_secure_file_new(&p, b"other").unwrap_err();
+        let io = err
+            .downcast_ref::<std::io::Error>()
+            .expect("error should wrap an io::Error");
+        assert_eq!(io.kind(), std::io::ErrorKind::AlreadyExists);
+        // Original content is intact.
+        assert_eq!(std::fs::read(&p).unwrap(), b"data");
+    }
+
+    // O_NOFOLLOW + O_EXCL: a symlink planted at the target must not be written through, so the
+    // symlink's target file is left untouched (anti-TOCTOU / CWE-59).
+    #[cfg(unix)]
+    #[test]
+    fn write_secure_file_new_refuses_symlink_target() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        std::fs::write(&real, b"orig").unwrap();
+        symlink(&real, &link).unwrap();
+
+        let res = write_secure_file_new(&link, b"pwned");
+        assert!(res.is_err(), "must refuse to write through a symlink at the target path");
+        assert_eq!(
+            std::fs::read(&real).unwrap(),
+            b"orig",
+            "the symlink's target must be untouched"
+        );
+    }
+
+    // Round-trip the hardened writer used everywhere else, plus its permission guarantee.
+    #[test]
+    fn write_secure_file_roundtrip_and_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f");
+        write_secure_file(&p, b"hello").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"hello");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // write_secure_file DOES overwrite (create+truncate), unlike the _new variant.
+        write_secure_file(&p, b"z").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"z");
+    }
 }

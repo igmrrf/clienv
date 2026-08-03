@@ -189,24 +189,46 @@ fn ensure_dir_0700(dir: &Path) -> Result<()> {
     if dir.as_os_str().is_empty() {
         return Ok(());
     }
-    std::fs::create_dir_all(dir)?;
+    // Create born-secure: DirBuilder with recursive+mode applies 0700 to each component it
+    // creates, so an intermediate dir is never briefly world-traversable at the process umask
+    // before a follow-up chmod (as create_dir_all + set_permissions on the leaf would leave it).
+    // Pre-existing components are left untouched, which is the desired behavior.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        use std::os::unix::fs::DirBuilderExt;
+        let mut b = std::fs::DirBuilder::new();
+        b.recursive(true);
+        b.mode(0o700);
+        b.create(dir)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)?;
     }
     Ok(())
 }
 
 /// Write `bytes` to `path` at mode 0600, refusing to clobber unless `force`.
 fn write_guarded(path: &Path, bytes: &[u8], force: bool) -> Result<()> {
-    if path.exists() && !force {
-        return Err(anyhow!("refusing to overwrite {} (use --force)", path.display()));
-    }
     if let Some(parent) = path.parent() {
         ensure_dir_0700(parent)?;
     }
-    crate::wallet::write_secure_file(path, bytes)?;
+    if force {
+        crate::wallet::write_secure_file(path, bytes)?;
+    } else {
+        // Exclusive create (O_EXCL): the "do not overwrite" decision is atomic, closing the
+        // TOCTOU window a prior `path.exists()` check would open. An AlreadyExists error — whether
+        // the file was there all along or an attacker interposed one between calls — maps back to
+        // the user-facing "use --force" message.
+        crate::wallet::write_secure_file_new(path, bytes).map_err(|e| {
+            if let Some(io) = e.downcast_ref::<std::io::Error>()
+                && io.kind() == std::io::ErrorKind::AlreadyExists
+            {
+                return anyhow!("refusing to overwrite {} (use --force)", path.display());
+            }
+            e
+        })?;
+    }
     Ok(())
 }
 
@@ -435,36 +457,131 @@ impl StagedDir {
         let path = self.path.join(name);
         let bytes = decode_body(&m.content, &m.encoding)?;
         crate::wallet::write_secure_file(&path, &bytes)?;
+        // Register the exact file so a SIGINT/SIGTERM handler can unlink it (async-signal-safe)
+        // before the staging dir is rmdir'd, even though Drop won't run on the `_exit` path.
+        register_staged_file(&path);
         Ok(path)
     }
 }
 
 impl Drop for StagedDir {
     fn drop(&mut self) {
+        // Normal / error exits wipe here. The signal registry is intentionally NOT pruned:
+        // a stale path only means the async-signal handler later calls unlink/rmdir on an
+        // already-removed path, which is a harmless ENOENT no-op.
         let _ = std::fs::remove_dir_all(&self.path);
-        unregister_staged_dir(&self.path);
     }
 }
 
-use std::sync::Mutex;
-lazy_static::lazy_static! {
-    static ref STAGED_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-}
+// ---------------------------------------------------------------------------
+// Lock-free staged-path registry for async-signal-safe cleanup.
+//
+// A SIGINT/SIGTERM handler may only call async-signal-safe functions: no heap allocation,
+// no std `Mutex`, no `opendir`/`readdir`/`remove_dir_all`. So instead of walking the dir in
+// the handler, we pre-register the EXACT staged file and dir paths here (allocation happens in
+// normal context), storing each as a leaked NUL-terminated C string behind an `AtomicPtr`. The
+// handler then only reads those pointers and issues raw `unlink(2)`/`rmdir(2)`/`_exit(2)` — all
+// async-signal-safe — wiping the plaintext even on a hard interrupt.
+//
+// Registrations are intentionally never freed or pruned: the pointers must stay valid for the
+// process lifetime so the handler can read them, and a stale entry only makes the handler call
+// unlink/rmdir on an already-removed path, a harmless ENOENT no-op. Capacity is bounded; on
+// overflow a path simply isn't registered (Drop still wipes it on any non-signal exit).
+// ---------------------------------------------------------------------------
+#[cfg(unix)]
+mod sigreg {
+    use super::install_signal_cleanup;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr;
+    use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-fn register_staged_dir(path: &Path) {
-    if let Ok(mut dirs) = STAGED_DIRS.lock() {
-        if dirs.is_empty() {
-            install_signal_cleanup();
+    const FILE_CAP: usize = 1024;
+    const DIR_CAP: usize = 64;
+
+    pub(super) static FILES: [AtomicPtr<libc::c_char>; FILE_CAP] =
+        [const { AtomicPtr::new(ptr::null_mut()) }; FILE_CAP];
+    pub(super) static FILE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static DIRS: [AtomicPtr<libc::c_char>; DIR_CAP] =
+        [const { AtomicPtr::new(ptr::null_mut()) }; DIR_CAP];
+    pub(super) static DIR_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    fn register(reg: &[AtomicPtr<libc::c_char>], count: &AtomicUsize, path: &Path) {
+        let c = match CString::new(path.as_os_str().as_bytes()) {
+            Ok(c) => c,
+            Err(_) => return, // path contains an interior NUL; cannot be a real staged path
+        };
+        let idx = count.fetch_add(1, Ordering::SeqCst);
+        if idx < reg.len() {
+            // Leak the C string on purpose: it must outlive every caller so the handler can read
+            // it. `into_raw` hands ownership to the static slot; we never reclaim it.
+            reg[idx].store(c.into_raw(), Ordering::SeqCst);
+        } else {
+            count.fetch_sub(1, Ordering::SeqCst);
         }
-        dirs.push(path.to_path_buf());
+    }
+
+    pub(super) fn register_file(path: &Path) {
+        install_signal_cleanup();
+        register(&FILES, &FILE_COUNT, path);
+    }
+
+    pub(super) fn register_dir(path: &Path) {
+        install_signal_cleanup();
+        register(&DIRS, &DIR_COUNT, path);
+    }
+
+    /// Async-signal-safe cleanup core: unlink each non-null FILE pointer, then rmdir each
+    /// non-null DIR pointer. Uses only atomic loads and the async-signal-safe syscalls
+    /// `unlink`/`rmdir` — no allocation, no lock, no directory walk. Parameterized over
+    /// caller-supplied slices so it can be unit-tested with a local registry (the real handler
+    /// passes the process-wide statics via `run_cleanup`).
+    ///
+    /// # Safety
+    /// Every non-null pointer in `files[..nf]` / `dirs[..nd]` must be a valid NUL-terminated C
+    /// string that stays valid for the duration of the call.
+    pub(super) unsafe fn wipe(
+        files: &[AtomicPtr<libc::c_char>],
+        nf: usize,
+        dirs: &[AtomicPtr<libc::c_char>],
+        nd: usize,
+    ) {
+        for slot in &files[..nf.min(files.len())] {
+            let p = slot.load(Ordering::SeqCst);
+            if !p.is_null() {
+                unsafe { libc::unlink(p) };
+            }
+        }
+        for slot in &dirs[..nd.min(dirs.len())] {
+            let p = slot.load(Ordering::SeqCst);
+            if !p.is_null() {
+                unsafe { libc::rmdir(p) };
+            }
+        }
+    }
+
+    /// Wipe every registered staged file/dir. Called from the signal handler.
+    pub(super) fn run_cleanup() {
+        let nf = FILE_COUNT.load(Ordering::SeqCst);
+        let nd = DIR_COUNT.load(Ordering::SeqCst);
+        unsafe { wipe(&FILES, nf, &DIRS, nd) };
     }
 }
 
-fn unregister_staged_dir(path: &Path) {
-    if let Ok(mut dirs) = STAGED_DIRS.lock() {
-        dirs.retain(|p| p != path);
-    }
+#[cfg(unix)]
+fn register_staged_file(path: &Path) {
+    sigreg::register_file(path);
 }
+#[cfg(not(unix))]
+fn register_staged_file(_path: &Path) {}
+
+#[cfg(unix)]
+fn register_staged_dir(path: &Path) {
+    sigreg::register_dir(path);
+}
+#[cfg(not(unix))]
+fn register_staged_dir(_path: &Path) {}
 
 #[cfg(unix)]
 fn install_signal_cleanup() {
@@ -478,21 +595,19 @@ fn install_signal_cleanup() {
 }
 
 #[cfg(not(unix))]
+#[allow(dead_code)]
 fn install_signal_cleanup() {}
 
-/// Best-effort staged-dir removal on SIGINT/SIGTERM, then terminate with the conventional
-/// 128+signal code. Filesystem ops here are not strictly async-signal-safe, but this is a
-/// last-ditch cleanup so no plaintext lingers when the process is interrupted.
+/// SIGINT/SIGTERM handler. Async-signal-safe: it reads only atomic pointers and calls the
+/// async-signal-safe syscalls `unlink`, `rmdir`, and `_exit`. It unlinks every registered staged
+/// FILE, then rmdirs every registered staging DIR (now empty), then terminates with the
+/// conventional 128+signal code. No heap allocation, no lock, no directory walk — so it cannot
+/// deadlock against the main thread and leaves no plaintext behind on a hard interrupt. Ordinary
+/// and error exits are still handled by `StagedDir`'s `Drop`.
 #[cfg(unix)]
 extern "C" fn signal_cleanup_handler(sig: libc::c_int) {
-    if let Ok(dirs) = STAGED_DIRS.lock() {
-        for p in dirs.iter() {
-            let _ = std::fs::remove_dir_all(p);
-        }
-    }
-    unsafe {
-        libc::_exit(128 + sig);
-    }
+    sigreg::run_cleanup();
+    unsafe { libc::_exit(128 + sig) };
 }
 
 /// If a decrypted secret carries file members or a file-kind body, stage them into a fresh
@@ -860,5 +975,82 @@ mod tests {
     #[test]
     fn decode_rejects_unknown_encoding() {
         assert!(decode_body("x", "rot13").is_err());
+    }
+
+    // The signal-cleanup path itself cannot be driven in-process (the handler ends in `_exit`),
+    // so we test the async-signal-safe cleanup CORE (`sigreg::wipe`) that the handler delegates
+    // to, over a local registry pointing at real files. This exercises the exact unlink+rmdir
+    // logic that removes plaintext on a hard interrupt, deterministically and in isolation.
+    #[cfg(unix)]
+    #[test]
+    fn sigreg_wipe_unlinks_files_then_rmdirs_dirs() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::atomic::{AtomicPtr, Ordering};
+
+        let root = tempfile::tempdir().unwrap();
+        let stage = root.path().join("bsec-stage");
+        std::fs::create_dir(&stage).unwrap();
+        let f1 = stage.join("secret.pem");
+        let f2 = stage.join(".env");
+        std::fs::write(&f1, b"PLAINTEXT-KEY").unwrap();
+        std::fs::write(&f2, b"DB=secret").unwrap();
+        assert!(f1.exists() && f2.exists() && stage.exists());
+
+        let c_f1 = CString::new(f1.as_os_str().as_bytes()).unwrap();
+        let c_f2 = CString::new(f2.as_os_str().as_bytes()).unwrap();
+        let c_dir = CString::new(stage.as_os_str().as_bytes()).unwrap();
+        let files = [AtomicPtr::new(c_f1.into_raw()), AtomicPtr::new(c_f2.into_raw())];
+        let dirs = [AtomicPtr::new(c_dir.into_raw())];
+
+        // SAFETY: all pointers are valid, NUL-terminated, and outlive the call.
+        unsafe { super::sigreg::wipe(&files, files.len(), &dirs, dirs.len()) };
+
+        assert!(!f1.exists(), "registered file should be unlinked");
+        assert!(!f2.exists(), "registered file should be unlinked");
+        assert!(!stage.exists(), "emptied staging dir should be rmdir'd");
+
+        // Reclaim the leaked CStrings so the test doesn't leak (the real registry leaks on
+        // purpose for process-lifetime validity; a test should not).
+        unsafe {
+            drop(CString::from_raw(files[0].load(Ordering::SeqCst)));
+            drop(CString::from_raw(files[1].load(Ordering::SeqCst)));
+            drop(CString::from_raw(dirs[0].load(Ordering::SeqCst)));
+        }
+    }
+
+    // A null pointer in a slot must be skipped, not dereferenced (slots can be null mid-store or
+    // beyond the live count).
+    #[cfg(unix)]
+    #[test]
+    fn sigreg_wipe_skips_null_slots() {
+        use std::sync::atomic::AtomicPtr;
+        let files: [AtomicPtr<libc::c_char>; 1] = [AtomicPtr::new(std::ptr::null_mut())];
+        let dirs: [AtomicPtr<libc::c_char>; 1] = [AtomicPtr::new(std::ptr::null_mut())];
+        // Must not panic / segfault on null entries.
+        unsafe { super::sigreg::wipe(&files, 1, &dirs, 1) };
+    }
+
+    // `register_staged_file` must record the exact path in the process-wide registry so the
+    // handler can later unlink it. Scan the whole registry for our unique path (order- and
+    // concurrency-independent).
+    #[cfg(unix)]
+    #[test]
+    fn register_staged_file_records_path_in_registry() {
+        use std::ffi::CStr;
+        use std::sync::atomic::Ordering;
+
+        let root = tempfile::tempdir().unwrap();
+        let unique = root.path().join("uniq-8f3ac1-secret.txt");
+        std::fs::write(&unique, b"x").unwrap();
+
+        super::register_staged_file(&unique);
+
+        let target = unique.to_string_lossy().to_string();
+        let found = super::sigreg::FILES.iter().any(|slot| {
+            let p = slot.load(Ordering::SeqCst);
+            !p.is_null() && unsafe { CStr::from_ptr(p) }.to_string_lossy() == target
+        });
+        assert!(found, "registered staged file was not found in the signal registry");
     }
 }
