@@ -63,16 +63,16 @@ cargo build --release
 
 ## 🚀 Deployment & Distribution Guides
 
-For platform-specific installation and deployment flows, see the [Documentation Index](file:///Users/igmrrf/Desktop/tmp/bsec/docs/README.md):
+For platform-specific installation and deployment flows, see the [Documentation Index](docs/README.md):
 
-* 📦 **Cargo (crates.io)**: [`docs/cargo.md`](file:///Users/igmrrf/Desktop/tmp/bsec/docs/cargo.md)
-* 🍺 **Homebrew**: [`docs/homebrew.md`](file:///Users/igmrrf/Desktop/tmp/bsec/docs/homebrew.md)
-* 🖥️ **GitHub Binary Releases**: [`docs/binary_releases.md`](file:///Users/igmrrf/Desktop/tmp/bsec/docs/binary_releases.md)
-* 🐳 **Docker & GHCR**: [`docs/docker.md`](file:///Users/igmrrf/Desktop/tmp/bsec/docs/docker.md)
-* 🐧 **Linux Packages (.deb, .rpm, AUR, snap)**: [`docs/linux_packages.md`](file:///Users/igmrrf/Desktop/tmp/bsec/docs/linux_packages.md)
-* 🪟 **Windows Packages (winget, choco, scoop)**: [`docs/windows_packages.md`](file:///Users/igmrrf/Desktop/tmp/bsec/docs/windows_packages.md)
-* 🟢 **NPM / NPX Engine**: [`docs/npm.md`](file:///Users/igmrrf/Desktop/tmp/bsec/docs/npm.md)
-* ⛓️ **Smart Contracts & EVM**: [`docs/smart_contracts.md`](file:///Users/igmrrf/Desktop/tmp/bsec/docs/smart_contracts.md)
+* 📦 **Cargo (crates.io)**: [`docs/cargo.md`](docs/cargo.md)
+* 🍺 **Homebrew**: [`docs/homebrew.md`](docs/homebrew.md)
+* 🖥️ **GitHub Binary Releases**: [`docs/binary_releases.md`](docs/binary_releases.md)
+* 🐳 **Docker & GHCR**: [`docs/docker.md`](docs/docker.md)
+* 🐧 **Linux Packages (.deb, .rpm, AUR, snap)**: [`docs/linux_packages.md`](docs/linux_packages.md)
+* 🪟 **Windows Packages (winget, choco, scoop)**: [`docs/windows_packages.md`](docs/windows_packages.md)
+* 🟢 **NPM / NPX Engine**: [`docs/npm.md`](docs/npm.md)
+* ⛓️ **Smart Contracts & EVM**: [`docs/smart_contracts.md`](docs/smart_contracts.md)
 
 ---
 

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use zeroize::Zeroizing;
 
-use crate::wallet::{derive_key_legacy, write_secure_file};
+use crate::wallet::write_secure_file;
 
 pub fn parse_env_content(content: &str) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
@@ -236,10 +236,6 @@ pub fn log_env_var(var_name: &str, file_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn derive_pass_key(pass: &str) -> [u8; 32] {
-    derive_key_legacy(pass)
-}
-
 pub fn get_encryption_password(env_file_name: &str, provided_pwd: Option<&str>) -> Result<String> {
     if let Some(p) = provided_pwd
         && !p.is_empty() {
@@ -328,9 +324,6 @@ pub fn decrypt_env_file(input_file: &Path, output_file: Option<&Path>, password:
         let salt = BASE64_STANDARD.decode(parts[0]).map_err(|_| anyhow!("Invalid salt"))?;
         let key = Zeroizing::new(crate::wallet::derive_key(&pwd, &salt)?);
         (key, parts[1], parts[2])
-    } else if parts.len() == 2 {
-        let key = Zeroizing::new(derive_pass_key(&pwd));
-        (key, parts[0], parts[1])
     } else {
         return Err(anyhow!("Invalid encrypted payload format"));
     };
@@ -368,9 +361,6 @@ pub fn load_and_parse_env(env_path: &Path, password: Option<&str>) -> Result<BTr
             let salt = BASE64_STANDARD.decode(parts[0]).map_err(|_| anyhow!("Invalid salt"))?;
             let key = crate::wallet::derive_key(&pwd, &salt)?;
             (key, parts[1], parts[2])
-        } else if parts.len() == 2 {
-            let key = derive_pass_key(&pwd);
-            (key, parts[0], parts[1])
         } else {
             return Err(anyhow!("Invalid encrypted payload format"));
         };

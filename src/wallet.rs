@@ -154,21 +154,6 @@ pub fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; 32]> {
     Ok(key)
 }
 
-pub fn derive_key_legacy(password: &str) -> [u8; 32] {
-    let salt = b"bsec_crypto_salt_v1";
-    let mut hasher = Sha256::new();
-    hasher.update(salt);
-    hasher.update(password.as_bytes());
-    let mut key: [u8; 32] = hasher.finalize().into();
-    for _ in 0..10_000 {
-        let mut h = Sha256::new();
-        h.update(key);
-        h.update(password.as_bytes());
-        key = h.finalize().into();
-    }
-    key
-}
-
 pub fn encrypt_wallet(data_str: &str, password: &str) -> Result<String> {
     let mut salt = [0u8; 16];
     OsRng.fill_bytes(&mut salt);
@@ -201,22 +186,6 @@ pub fn decrypt_wallet(encrypted_str: &str, password: &str) -> Result<String> {
         let nonce = Nonce::from_slice(&decoded_nonce);
         let cipher_text = BASE64_STANDARD
             .decode(parts[2])
-            .map_err(|_| anyhow!("Invalid ciphertext base64"))?;
-        let plaintext = cipher
-            .decrypt(nonce, cipher_text.as_ref())
-            .map_err(|_| BsecError::InvalidPassword)?;
-        let text_str = String::from_utf8(plaintext).map_err(|e| anyhow!("UTF8 decode error: {}", e))?;
-        Ok(text_str)
-    } else if parts.len() == 2 {
-        let key = derive_key_legacy(password);
-        let cipher = Aes256Gcm::new_from_slice(&key)
-            .map_err(|_| anyhow!("invalid cipher key"))?;
-        let decoded_nonce = BASE64_STANDARD
-            .decode(parts[0])
-            .map_err(|_| anyhow!("Invalid nonce base64"))?;
-        let nonce = Nonce::from_slice(&decoded_nonce);
-        let cipher_text = BASE64_STANDARD
-            .decode(parts[1])
             .map_err(|_| anyhow!("Invalid ciphertext base64"))?;
         let plaintext = cipher
             .decrypt(nonce, cipher_text.as_ref())

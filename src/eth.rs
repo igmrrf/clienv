@@ -1,7 +1,9 @@
 //! Ethereum JSON-RPC + transaction layer.
 //!
 //! Real on-chain interaction: ABI encode/decode for the BsecSecretRegistry contract,
-//! EIP-155 legacy transaction signing (secp256k1 via k256), and receipt polling.
+//! transaction signing (secp256k1 via k256), and receipt polling. Chains that report a
+//! `baseFeePerGas` (post-London) are sent EIP-1559 type-2 transactions; chains without one
+//! fall back to EIP-155 legacy signing.
 //! No fabricated results: every call hits the configured RPC endpoint or returns an error.
 
 use anyhow::{anyhow, Result};
@@ -353,6 +355,113 @@ fn sign_legacy_tx(
     Ok(format!("0x{}", bytes_to_hex(&signed)))
 }
 
+/// Default tip if the node does not expose `eth_maxPriorityFeePerGas` (1.5 gwei).
+const DEFAULT_PRIORITY_FEE_WEI: u128 = 1_500_000_000;
+
+/// Fetch `baseFeePerGas` of the latest block. `None` means the chain is pre-London
+/// (no base fee) and must be sent a legacy transaction.
+fn latest_base_fee(conf: &NetworkConfig) -> Result<Option<u128>> {
+    let block = rpc(conf, "eth_getBlockByNumber", json!(["latest", false]))?;
+    match block.get("baseFeePerGas").and_then(|v| v.as_str()) {
+        Some(s) => Ok(Some(hex_to_u128(s)?)),
+        None => Ok(None),
+    }
+}
+
+/// Suggested priority fee (tip) from the node, falling back to a fixed default.
+fn suggested_priority_fee(conf: &NetworkConfig) -> u128 {
+    match rpc(conf, "eth_maxPriorityFeePerGas", json!([])) {
+        Ok(v) => v
+            .as_str()
+            .and_then(|s| hex_to_u128(s).ok())
+            .unwrap_or(DEFAULT_PRIORITY_FEE_WEI),
+        Err(_) => DEFAULT_PRIORITY_FEE_WEI,
+    }
+}
+
+/// RLP-encode the EIP-1559 type-2 field list (without the 0x02 type byte).
+/// `access_list` is always the empty list (0xc0); signature fields are appended when present.
+#[allow(clippy::too_many_arguments)]
+fn eip1559_field_list(
+    chain_id: u64,
+    nonce: u128,
+    max_priority_fee: u128,
+    max_fee: u128,
+    gas_limit: u128,
+    to: &[u8; 20],
+    value: u128,
+    data: &[u8],
+    sig: Option<(u8, &[u8], &[u8])>,
+) -> Vec<u8> {
+    let mut items: Vec<Vec<u8>> = vec![
+        rlp_str(&be_trim_u128(chain_id as u128)),
+        rlp_str(&be_trim_u128(nonce)),
+        rlp_str(&be_trim_u128(max_priority_fee)),
+        rlp_str(&be_trim_u128(max_fee)),
+        rlp_str(&be_trim_u128(gas_limit)),
+        rlp_str(to),
+        rlp_str(&be_trim_u128(value)),
+        rlp_str(data),
+        vec![0xc0], // access_list: empty RLP list
+    ];
+    if let Some((y_parity, r, s)) = sig {
+        items.push(rlp_str(&be_trim_u128(y_parity as u128)));
+        items.push(rlp_str(&be_trim(r)));
+        items.push(rlp_str(&be_trim(s)));
+    }
+    let mut payload = Vec::new();
+    for it in &items {
+        payload.extend_from_slice(it);
+    }
+    let mut out = encode_len(payload.len(), 0xc0, 0xf7);
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// Sign an EIP-1559 (type-2) transaction and return the 0x-prefixed raw tx.
+#[allow(clippy::too_many_arguments)]
+fn sign_eip1559_tx(
+    priv_bytes: &[u8],
+    chain_id: u64,
+    nonce: u128,
+    max_priority_fee: u128,
+    max_fee: u128,
+    gas_limit: u128,
+    to: &[u8; 20],
+    value: u128,
+    data: &[u8],
+) -> Result<String> {
+    let unsigned = eip1559_field_list(
+        chain_id, nonce, max_priority_fee, max_fee, gas_limit, to, value, data, None,
+    );
+    let mut to_hash = Vec::with_capacity(1 + unsigned.len());
+    to_hash.push(0x02);
+    to_hash.extend_from_slice(&unsigned);
+    let hash = keccak256(&to_hash);
+
+    let signing_key = SigningKey::from_slice(priv_bytes).map_err(|e| anyhow!("invalid signing key: {}", e))?;
+    let (sig, recid) = signing_key
+        .sign_prehash_recoverable(&hash)
+        .map_err(|e| anyhow!("transaction signing failed: {}", e))?;
+    let sig_bytes = sig.to_bytes();
+    // For type-2 txs the signature's v is the raw y-parity (0 or 1), not the EIP-155 form.
+    let signed = eip1559_field_list(
+        chain_id,
+        nonce,
+        max_priority_fee,
+        max_fee,
+        gas_limit,
+        to,
+        value,
+        data,
+        Some((recid.to_byte(), &sig_bytes[..32], &sig_bytes[32..64])),
+    );
+    let mut tx = Vec::with_capacity(1 + signed.len());
+    tx.push(0x02);
+    tx.extend_from_slice(&signed);
+    Ok(format!("0x{}", bytes_to_hex(&tx)))
+}
+
 /// Build, sign, and broadcast a contract-call transaction; wait for a successful receipt.
 /// Returns the transaction hash.
 pub fn send_contract_tx(
@@ -368,11 +477,6 @@ pub fn send_contract_tx(
         rpc(conf, "eth_getTransactionCount", json!([from_hex, "pending"]))?
             .as_str()
             .ok_or_else(|| anyhow!("eth_getTransactionCount returned non-string"))?,
-    )?;
-    let gas_price = hex_to_u128(
-        rpc(conf, "eth_gasPrice", json!([]))?
-            .as_str()
-            .ok_or_else(|| anyhow!("eth_gasPrice returned non-string"))?,
     )?;
 
     let call_obj = json!({
@@ -392,7 +496,24 @@ pub fn send_contract_tx(
     };
 
     let chain_id = conf.chain_id as u64;
-    let raw = sign_legacy_tx(priv_bytes, nonce, gas_price, gas_limit, to, 0, data, chain_id)?;
+    // Post-London chains report a base fee -> send EIP-1559 type-2. Pre-London chains have
+    // none -> fall back to EIP-155 legacy signing.
+    let raw = match latest_base_fee(conf)? {
+        Some(base_fee) => {
+            let priority = suggested_priority_fee(conf);
+            // Standard headroom: cover up to a doubling of the base fee before the tip.
+            let max_fee = base_fee.saturating_mul(2).saturating_add(priority);
+            sign_eip1559_tx(priv_bytes, chain_id, nonce, priority, max_fee, gas_limit, to, 0, data)?
+        }
+        None => {
+            let gas_price = hex_to_u128(
+                rpc(conf, "eth_gasPrice", json!([]))?
+                    .as_str()
+                    .ok_or_else(|| anyhow!("eth_gasPrice returned non-string"))?,
+            )?;
+            sign_legacy_tx(priv_bytes, nonce, gas_price, gas_limit, to, 0, data, chain_id)?
+        }
+    };
 
     let tx_hash = rpc(conf, "eth_sendRawTransaction", json!([raw]))?
         .as_str()
@@ -452,6 +573,26 @@ mod tests {
     fn selector_transfer() {
         // keccak256("transfer(address,uint256)")[..4] = 0xa9059cbb
         assert_eq!(selector("transfer(address,uint256)"), [0xa9, 0x05, 0x9c, 0xbb]);
+    }
+
+    #[test]
+    fn eip1559_type_byte_and_determinism() {
+        let mut pk = [0u8; 32];
+        pk[31] = 1;
+        let to = [0x11u8; 20];
+        let raw1 = sign_eip1559_tx(&pk, 1, 0, 1_000_000_000, 30_000_000_000, 21000, &to, 0, b"").unwrap();
+        let raw2 = sign_eip1559_tx(&pk, 1, 0, 1_000_000_000, 30_000_000_000, 21000, &to, 0, b"").unwrap();
+        // Type-2 envelope: first byte after 0x is the 0x02 type marker.
+        assert!(raw1.starts_with("0x02"));
+        // RFC6979 deterministic signing -> identical inputs yield identical raw tx.
+        assert_eq!(raw1, raw2);
+    }
+
+    #[test]
+    fn eip1559_empty_access_list_encoding() {
+        // The access_list field is the RLP empty list, a single 0xc0 byte.
+        let list = eip1559_field_list(1, 0, 0, 0, 0, &[0u8; 20], 0, b"", None);
+        assert!(list.contains(&0xc0));
     }
 
     #[test]

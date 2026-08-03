@@ -113,9 +113,10 @@ contract BsecSecretRegistry {
             if (msg.sender != record.recipient && msg.sender != record.sender) {
                 revert UnauthorizedViewer(secretId, msg.sender);
             }
+            // Only non-public secrets track reads. Incrementing for public secrets would
+            // waste storage-write gas without enforcing any limit.
+            record.readCount += 1;
         }
-
-        record.readCount += 1;
 
         emit SecretViewed(secretId, msg.sender, record.readCount, record.maxReads);
     }

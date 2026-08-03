@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased — production gates: CI, EIP-1559, legacy KDF removal
+
+Closes the in-repo production-readiness gates from `production_readiness_report.md`.
+
+### New
+
+- **EIP-1559 (type-2) transaction support.** `send_contract_tx` now detects a chain's
+  `baseFeePerGas` (post-London) and sends a signed type-2 transaction with a node-suggested
+  `maxPriorityFeePerGas` and a `maxFeePerGas` sized at `2 × baseFee + tip`. Chains that report
+  no base fee still fall back to EIP-155 legacy signing. New unit tests cover the type-2
+  envelope byte, deterministic signing, and the empty access-list encoding.
+- **CI pipeline** (`.github/workflows/ci.yml`): `cargo fmt --check`, `cargo clippy -D warnings`,
+  the full test suite, `cargo llvm-cov` coverage (lcov artifact), and a `cargo audit`
+  dependency-advisory gate that fails the build on any RUSTSEC advisory (also runs weekly).
+
+### Security
+
+- **Legacy KDF removed.** The 10,000-iteration SHA-256 wallet/`.env.enc` key-derivation path
+  (fixed `bsec_crypto_salt_v1` salt) is deleted — `derive_key_legacy`, `derive_pass_key`, and
+  the 2-part ciphertext format no longer exist. All wallet and env encryption is Argon2id +
+  AES-256-GCM only (3-part salt:nonce:ciphertext). Pre-Argon2id blobs no longer decrypt.
+
+### Docs
+
+- **External audit + verification runbook** (`docs/security_audit.md`): step-by-step process
+  for the independent `BsecSecretRegistry.sol` audit and on-chain (explorer + Sourcify) bytecode
+  verification, each with a completion checklist.
+- Fixed absolute-workstation `file:///Users/igmrrf/...` links in `deployment.md` and
+  `docs/smart_contracts.md` to relative repo paths.
+
 ## Unreleased — secret → file materialization
 
 Additive feature: a shared secret can now be materialized into one or more real files, carry
