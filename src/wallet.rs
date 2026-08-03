@@ -121,6 +121,35 @@ pub fn write_secure_file(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Like `write_secure_file` but fails (AlreadyExists) if the path already exists.
+/// O_EXCL (via `create_new`) makes the "do not overwrite" decision atomic (no TOCTOU,
+/// CWE-367): an existence check followed by a separate open can race a planted file, but a
+/// single exclusive-create open cannot. O_NOFOLLOW still refuses a symlink at the final
+/// component. Use this for the non-force write path; `write_secure_file` (create+truncate)
+/// remains for the force path and all existing callers.
+pub fn write_secure_file_new(path: &Path, content: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        file.write_all(content)?;
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+        file.write_all(content)?;
+    }
+    set_private_file_permissions(path);
+    Ok(())
+}
+
 
 pub fn hash_digest(input: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -423,4 +452,71 @@ pub fn get_wallet_info(password: Option<&str>) -> Result<WalletInfo> {
     };
 
     Ok(info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_secure_file_new_creates_0600_then_refuses_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("secret");
+
+        write_secure_file_new(&p, b"data").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"data");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+
+        // Exclusive create (O_EXCL): a second write to the same path must fail with
+        // AlreadyExists, atomically — never a silent truncating overwrite.
+        let err = write_secure_file_new(&p, b"other").unwrap_err();
+        let io = err
+            .downcast_ref::<std::io::Error>()
+            .expect("error should wrap an io::Error");
+        assert_eq!(io.kind(), std::io::ErrorKind::AlreadyExists);
+        // Original content is intact.
+        assert_eq!(std::fs::read(&p).unwrap(), b"data");
+    }
+
+    // O_NOFOLLOW + O_EXCL: a symlink planted at the target must not be written through, so the
+    // symlink's target file is left untouched (anti-TOCTOU / CWE-59).
+    #[cfg(unix)]
+    #[test]
+    fn write_secure_file_new_refuses_symlink_target() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        std::fs::write(&real, b"orig").unwrap();
+        symlink(&real, &link).unwrap();
+
+        let res = write_secure_file_new(&link, b"pwned");
+        assert!(res.is_err(), "must refuse to write through a symlink at the target path");
+        assert_eq!(
+            std::fs::read(&real).unwrap(),
+            b"orig",
+            "the symlink's target must be untouched"
+        );
+    }
+
+    // Round-trip the hardened writer used everywhere else, plus its permission guarantee.
+    #[test]
+    fn write_secure_file_roundtrip_and_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f");
+        write_secure_file(&p, b"hello").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"hello");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // write_secure_file DOES overwrite (create+truncate), unlike the _new variant.
+        write_secure_file(&p, b"z").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"z");
+    }
 }

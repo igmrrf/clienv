@@ -60,20 +60,30 @@ pub fn bytes_to_checksum_address(bytes: &[u8; 20]) -> String {
     checksummed
 }
 
-/// Encode a secret ID string into a bytes32 contract key. Hex "0x..." IDs are decoded;
-/// other IDs use their raw UTF-8 bytes. Both are used consistently for register and read.
-pub fn encode_bytes32_hex(id_str: &str) -> [u8; 32] {
+/// Encode a secret ID string into a bytes32 contract key. Only two shapes are accepted,
+/// both mapped losslessly and left-aligned:
+///
+/// - a "0x"-prefixed hex string that decodes to AT MOST 32 bytes, or
+/// - a non-hex ID whose raw UTF-8 is AT MOST 32 bytes.
+///
+/// Anything longer is rejected rather than silently truncated — silent truncation let
+/// distinct IDs collide on the same on-chain bytes32 key.
+pub fn encode_bytes32_hex(id_str: &str) -> Result<[u8; 32]> {
     let mut bytes = [0u8; 32];
-    if id_str.starts_with("0x")
-        && let Ok(b) = crate::wallet::hex_to_bytes(id_str)
-    {
-        let len = b.len().min(32);
-        bytes[..len].copy_from_slice(&b[..len]);
-        return bytes;
+    if id_str.starts_with("0x") {
+        let b = crate::wallet::hex_to_bytes(id_str)?;
+        if b.len() > 32 {
+            return Err(anyhow!("secret ID {:?} decodes to {} bytes; max 32", id_str, b.len()));
+        }
+        bytes[..b.len()].copy_from_slice(&b);
+        return Ok(bytes);
     }
-    let len = id_str.len().min(32);
-    bytes[..len].copy_from_slice(&id_str.as_bytes()[..len]);
-    bytes
+    let raw = id_str.as_bytes();
+    if raw.len() > 32 {
+        return Err(anyhow!("secret ID {:?} is {} bytes; max 32", id_str, raw.len()));
+    }
+    bytes[..raw.len()].copy_from_slice(raw);
+    Ok(bytes)
 }
 
 fn registry_address(conf: &NetworkConfig) -> Result<[u8; 20]> {
@@ -152,7 +162,7 @@ pub fn register_secret_on_chain(
 ) -> Result<String> {
     let conf = load_network_config();
     let to = registry_address(&conf)?;
-    let id32 = encode_bytes32_hex(secret_id);
+    let id32 = encode_bytes32_hex(secret_id)?;
     let data = eth::encode_share_secret(&id32, recipient_addr, ipfs_cid, expires_at, max_reads, is_public);
     let tx_hash = eth::send_contract_tx(&conf, priv_bytes, &to, &data)?;
     index_note(secret_id, "sender");
@@ -162,7 +172,7 @@ pub fn register_secret_on_chain(
 pub fn get_secret_info_on_chain(secret_id: &str) -> Result<OnChainSecretInfo> {
     let conf = load_network_config();
     let to = registry_address(&conf)?;
-    let id32 = encode_bytes32_hex(secret_id);
+    let id32 = encode_bytes32_hex(secret_id)?;
     let data = eth::encode_bytes32_call("getSecretInfo(bytes32)", &id32);
 
     let ret = eth::eth_call(&conf, &to, &data).map_err(|e| {
@@ -198,7 +208,7 @@ pub fn get_secret_info_on_chain(secret_id: &str) -> Result<OnChainSecretInfo> {
 pub fn record_read_on_chain(priv_bytes: &[u8], secret_id: &str) -> Result<()> {
     let conf = load_network_config();
     let to = registry_address(&conf)?;
-    let id32 = encode_bytes32_hex(secret_id);
+    let id32 = encode_bytes32_hex(secret_id)?;
     let data = eth::encode_bytes32_call("recordRead(bytes32)", &id32);
     eth::send_contract_tx(&conf, priv_bytes, &to, &data)?;
     Ok(())
@@ -207,7 +217,7 @@ pub fn record_read_on_chain(priv_bytes: &[u8], secret_id: &str) -> Result<()> {
 pub fn revoke_secret_on_chain(priv_bytes: &[u8], secret_id: &str) -> Result<()> {
     let conf = load_network_config();
     let to = registry_address(&conf)?;
-    let id32 = encode_bytes32_hex(secret_id);
+    let id32 = encode_bytes32_hex(secret_id)?;
     let data = eth::encode_bytes32_call("revokeSecret(bytes32)", &id32);
     eth::send_contract_tx(&conf, priv_bytes, &to, &data)?;
     Ok(())
@@ -275,4 +285,61 @@ pub fn list_secrets_on_chain(
     }
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_0x_64hex_decodes_to_32_bytes() {
+        let id = format!("0x{}", "ab".repeat(32)); // 0x + 64 hex chars = 32 bytes
+        let out = encode_bytes32_hex(&id).expect("valid 32-byte hex id must encode");
+        assert_eq!(out, [0xabu8; 32]);
+    }
+
+    #[test]
+    fn oversized_0x_hex_is_rejected() {
+        let id = format!("0x{}", "cd".repeat(33)); // decodes to 33 bytes > 32
+        assert!(encode_bytes32_hex(&id).is_err());
+    }
+
+    #[test]
+    fn oversized_raw_id_is_rejected() {
+        let id = "z".repeat(33); // non-hex raw id, 33 bytes > 32
+        assert!(encode_bytes32_hex(&id).is_err());
+    }
+
+    #[test]
+    fn short_raw_id_is_left_aligned() {
+        let out = encode_bytes32_hex("hello").expect("short raw id must encode");
+        let mut expected = [0u8; 32];
+        expected[..5].copy_from_slice(b"hello");
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn checksum_address_eip55_known_vectors() {
+        // Parse a 40-hex string into a fixed 20-byte address.
+        fn addr(hex: &str) -> [u8; 20] {
+            let bytes = crate::wallet::hex_to_bytes(hex).expect("valid 40-hex address");
+            let mut out = [0u8; 20];
+            out.copy_from_slice(&bytes);
+            out
+        }
+
+        // Official EIP-55 checksum vectors.
+        assert_eq!(
+            bytes_to_checksum_address(&addr("5aaeb6053f3e94c9b9a09f33669435e7ef1beaed")),
+            "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"
+        );
+        assert_eq!(
+            bytes_to_checksum_address(&addr("fb6916095ca1df60bb79ce92ce3ea74c37c5d359")),
+            "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359"
+        );
+        assert_eq!(
+            bytes_to_checksum_address(&addr("dbf03b407c01e7cd3cbea99509d93f8dddc8c6fb")),
+            "0xdbF03B407c01E7cD3CBea99509d93f8DDDC8C6FB"
+        );
+    }
 }

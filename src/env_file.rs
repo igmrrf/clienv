@@ -144,7 +144,9 @@ pub fn convert_env_file(
         }
     };
 
-    fs::write(output_file, output_str)?;
+    // Output carries actual secret values; write via the hardened writer (mode 0600,
+    // O_NOFOLLOW) so it is never world/group readable and cannot be redirected via a symlink.
+    write_secure_file(output_file, output_str.as_bytes())?;
     Ok(())
 }
 
@@ -162,7 +164,9 @@ pub fn validate_env_file(schema_path: &Path, env_path: &Path) -> Result<()> {
         for k in schema_map.keys() {
             lines.push(format!("{}=", k));
         }
-        fs::write(env_path, lines.join("\n"))?;
+        // Derived from an env file; use the hardened writer (mode 0600, O_NOFOLLOW) so any
+        // future secret values live in a file that is never group/world readable.
+        write_secure_file(env_path, lines.join("\n").as_bytes())?;
         println!("Environment file created successfully.");
         return Ok(());
     }
@@ -191,7 +195,9 @@ pub fn validate_env_file(schema_path: &Path, env_path: &Path) -> Result<()> {
         for key in missing_keys {
             new_lines.push(format!("{}=", key));
         }
-        fs::write(env_path, new_lines.join("\n"))?;
+        // Rewrites the existing .env with its real values plus appended keys; use the
+        // hardened writer (mode 0600, O_NOFOLLOW) to preserve restrictive perms and reject symlinks.
+        write_secure_file(env_path, new_lines.join("\n").as_bytes())?;
         println!("Updated '{}' with missing keys.", env_path.display());
     } else {
         println!("Environment file '{}' is valid and matches schema.", env_path.display());
@@ -209,7 +215,9 @@ pub fn generate_template(env_path: &Path, output_path: &Path) -> Result<()> {
         lines.push(format!("{}=#Your {} here", k, k));
     }
 
-    fs::write(output_path, lines.join("\n"))?;
+    // Derived from an env file; route through the hardened writer (mode 0600, O_NOFOLLOW)
+    // so anything produced from env-file contents keeps restrictive perms and rejects symlinks.
+    write_secure_file(output_path, lines.join("\n").as_bytes())?;
     Ok(())
 }
 
@@ -494,11 +502,15 @@ pub fn run_with_envs(
     } else if target_secret_id.is_none() {
         let default_local = Path::new(".env.local");
         if default_local.exists() {
+            // Surface the implicit load so it is obvious in an untrusted working directory.
+            eprintln!("Note: auto-loaded environment from {} in the current directory", default_local.display());
             let file_vars = load_and_parse_env(default_local, password)?;
             env_map.extend(file_vars);
         } else {
             let default_env = Path::new(".env");
             if default_env.exists() {
+                // Surface the implicit load so it is obvious in an untrusted working directory.
+                eprintln!("Note: auto-loaded environment from {} in the current directory", default_env.display());
                 let file_vars = load_and_parse_env(default_env, password)?;
                 env_map.extend(file_vars);
             }
@@ -515,6 +527,14 @@ pub fn run_with_envs(
         if !safe_env_name(&k) {
             return Err(anyhow!(
                 "refusing to inject unsafe environment variable name {:?} from secret/env file",
+                k
+            ));
+        }
+        // A key or value with an interior NUL byte would otherwise fail at spawn with an
+        // opaque OS error; reject it explicitly so the offending variable is named.
+        if k.contains('\0') || v.contains('\0') {
+            return Err(anyhow!(
+                "refusing to inject environment variable {:?} whose value contains a NUL byte",
                 k
             ));
         }
