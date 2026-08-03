@@ -37,6 +37,65 @@ jobs:
       - name: cargo test
         run: cargo test --all-features
 
+  e2e:
+    name: e2e on-chain flows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # anvil (chain-id 31337, 1s blocks, 10 pre-funded accounts) + a Kubo IPFS node.
+      - name: Start anvil + IPFS
+        run: docker compose up -d
+
+      - name: Wait for anvil RPC
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -sf -X POST http://localhost:8545 -H 'content-type: application/json' \
+                 -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' | grep -q result; then
+              echo "anvil up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "anvil did not come up"; docker compose logs anvil; exit 1
+
+      - name: Wait for IPFS API
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -sf -X POST http://localhost:5001/api/v0/id | grep -q '"ID"'; then
+              echo "ipfs up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "ipfs did not come up"; docker compose logs ipfs; exit 1
+
+      # Deploy the registry with a runner-native Foundry (no docker-in-docker host networking).
+      - uses: foundry-rs/foundry-toolchain@v1
+      - name: Deploy BsecSecretRegistry to anvil
+        id: deploy
+        env:
+          # anvil dev account #0 private key (well-known, local-only).
+          ANVIL_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+        run: |
+          OUT=$(forge create contracts/BsecSecretRegistry.sol:BsecSecretRegistry \
+                  --rpc-url http://localhost:8545 --private-key "$ANVIL_KEY" --broadcast)
+          echo "$OUT"
+          REG=$(echo "$OUT" | grep -Eo 'Deployed to: 0x[0-9a-fA-F]{40}' | awk '{print $3}')
+          test -n "$REG" || { echo "failed to parse deployed address"; exit 1; }
+          echo "registry=$REG" >> "$GITHUB_OUTPUT"
+
+      # Each test uses an isolated BSEC_HOME; the harness configures it for this stack and funds
+      # its fresh wallet from anvil account #0. --test-threads=1 avoids nonce races.
+      - name: Run gated on-chain tests
+        env:
+          BSEC_E2E: "1"
+          BSEC_E2E_REGISTRY: ${{ steps.deploy.outputs.registry }}
+          BSEC_E2E_RPC: "http://localhost:8545"
+          BSEC_E2E_IPFS_GATEWAY: "http://localhost:8080/ipfs/"
+          BSEC_E2E_FUNDER: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+        run: cargo test --test materialize_tests --test secrets_tests -- --test-threads=1
+
   coverage:
     name: coverage (llvm-cov)
     runs-on: ubuntu-latest

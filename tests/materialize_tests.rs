@@ -43,7 +43,55 @@ fn bsec(home: &Path) -> Result<Command, Box<dyn std::error::Error>> {
 fn init_wallet(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd = bsec(home)?;
     cmd.arg("init").arg("--overwrite").arg("--no-encryption");
-    cmd.assert().success();
+    let out = cmd.output()?;
+    assert!(out.status.success(), "wallet init failed");
+    if e2e_enabled() {
+        // The e2e stack is shared but each test uses an isolated BSEC_HOME with a fresh wallet
+        // and a default (non-local) network config. Point this home at the local anvil/IPFS
+        // stack and fund the new wallet so its on-chain txs (share/read/revoke) succeed.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let addr = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("Address: "))
+            .map(|s| s.trim().to_string())
+            .expect("init output should contain the wallet address");
+        provision_local(home, &addr)?;
+    }
+    Ok(())
+}
+
+/// Configure `home` for the local e2e stack and fund its wallet from anvil's unlocked account.
+/// Reads connection details from env so CI can inject them:
+///   BSEC_E2E_RPC (default http://localhost:8545), BSEC_E2E_REGISTRY (required),
+///   BSEC_E2E_IPFS_GATEWAY (default http://localhost:8080/ipfs/),
+///   BSEC_E2E_FUNDER (default anvil account #0).
+fn provision_local(home: &Path, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let rpc = std::env::var("BSEC_E2E_RPC").unwrap_or_else(|_| "http://localhost:8545".to_string());
+    let registry = std::env::var("BSEC_E2E_REGISTRY")
+        .expect("BSEC_E2E_REGISTRY must be set for e2e (the deployed BsecSecretRegistry address)");
+    let gateway = std::env::var("BSEC_E2E_IPFS_GATEWAY")
+        .unwrap_or_else(|_| "http://localhost:8080/ipfs/".to_string());
+    let funder = std::env::var("BSEC_E2E_FUNDER")
+        .unwrap_or_else(|_| "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".to_string());
+
+    let mut cfg = bsec(home)?;
+    cfg.args([
+        "config", "--network", "local", "--rpc", &rpc, "--registry", &registry,
+        "--ipfs-gateway", &gateway,
+    ]);
+    cfg.assert().success();
+
+    // Fund via anvil's unlocked account (eth_sendTransaction from account #0). 10 ETH.
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"eth_sendTransaction","params":[{{"from":"{}","to":"{}","value":"0x8ac7230489e80000"}}]}}"#,
+        funder, addr
+    );
+    let out = Command::new("curl")
+        .args(["-s", "-X", "POST", &rpc, "-H", "content-type: application/json", "-d", &body])
+        .output()?;
+    assert!(out.status.success(), "funding RPC call failed");
+    // Let anvil (block-time 1s) mine the funding tx before the wallet spends.
+    std::thread::sleep(std::time::Duration::from_secs(2));
     Ok(())
 }
 
