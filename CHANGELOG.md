@@ -1,0 +1,144 @@
+# Changelog
+
+## Unreleased — production gates: CI, EIP-1559, legacy KDF removal
+
+Closes the in-repo production-readiness gates from `production_readiness_report.md`.
+
+### New
+
+- **EIP-1559 (type-2) transaction support.** `send_contract_tx` now detects a chain's
+  `baseFeePerGas` (post-London) and sends a signed type-2 transaction with a node-suggested
+  `maxPriorityFeePerGas` and a `maxFeePerGas` sized at `2 × baseFee + tip`. Chains that report
+  no base fee still fall back to EIP-155 legacy signing. New unit tests cover the type-2
+  envelope byte, deterministic signing, and the empty access-list encoding.
+- **CI pipeline** (`.github/workflows/ci.yml`): `cargo fmt --check`, `cargo clippy -D warnings`,
+  the full test suite, `cargo llvm-cov` coverage (lcov artifact), and a `cargo audit`
+  dependency-advisory gate that fails the build on any RUSTSEC advisory (also runs weekly).
+
+### Security
+
+- **Legacy KDF removed.** The 10,000-iteration SHA-256 wallet/`.env.enc` key-derivation path
+  (fixed `bsec_crypto_salt_v1` salt) is deleted — `derive_key_legacy`, `derive_pass_key`, and
+  the 2-part ciphertext format no longer exist. All wallet and env encryption is Argon2id +
+  AES-256-GCM only (3-part salt:nonce:ciphertext). Pre-Argon2id blobs no longer decrypt.
+
+### Docs
+
+- **External audit + verification runbook** (`docs/security_audit.md`): step-by-step process
+  for the independent `BsecSecretRegistry.sol` audit and on-chain (explorer + Sourcify) bytecode
+  verification, each with a completion checklist.
+- Fixed absolute-workstation `file:///Users/igmrrf/...` links in `deployment.md` and
+  `docs/smart_contracts.md` to relative repo paths.
+
+## Unreleased — secret → file materialization
+
+Additive feature: a shared secret can now be materialized into one or more real files, carry
+a multi-file bundle, expose a keys-only schema, and be staged for `run`. No contract change;
+existing shared secrets (`view`, `view --output`, `run --env-file`) behave exactly as before.
+
+### New
+
+- **`bsec materialize <id>`** writes a decrypted secret to real file(s) at mode `0600` under
+  `0700` directories. `--file`/`--dir` choose the target; `--as env|pem|json|cred|schema`
+  overrides the format; `--force` overwrites. One materialize = one on-chain read (a bundle
+  counts as one, not N). Untagged legacy secrets resolve their format by content sniff.
+- **`share` file/bundle flags.** `--file` now infers a file `kind` (or takes `--as`), records a
+  suggested `--filename`, and base64-encodes binary bodies. `--bundle <manifest.json>` packs
+  several files into one secret. `--no-export` seals a secret against all file writes.
+- **`run --secret <id>`** stages a bundle / file-kind secret into a temp dir wiped on exit
+  (Drop plus a best-effort SIGINT/SIGTERM handler), injecting `<STEM>_FILE=<abspath>` per
+  member, any manifest `env` alias, and env-member `KEY=VAL` pairs.
+- **`materialize --as schema`** emits sorted `KEY=` lines (values withheld) for env/json/cred
+  secrets — the format `validate`/`generate` already consume.
+
+### Security
+
+- **Bundle member bodies are encrypted at rest.** Only `IpfsPayload.content`/`content_key`
+  are ciphertext; the payload JSON itself is stored on IPFS in cleartext. Each bundle member's
+  body is therefore sealed with the per-secret content key before upload — otherwise bundled
+  secrets would leak in cleartext. (The design note that called the whole payload AEAD-encrypted
+  did not match this codebase.)
+- **Filename safety.** Sender-supplied filenames are sanitized to plain basenames — path
+  separators, `..` traversal, `~` expansion, absolute paths, and NUL are rejected.
+- **`no_export` seal.** Blocks `materialize`, `materialize --as schema`, and `view --output`;
+  allows terminal `view` and `run --secret` staging (temp-only, wiped). Documented as an
+  in-tool control, not a cryptographic guarantee, in the README security model.
+- **`view --output` now writes mode 0600** (was a plain world-readable `fs::write`).
+
+## Unreleased — real on-chain + IPFS, security & correctness hardening
+
+Production-readiness pass. Replaces the simulated blockchain/IPFS layers with real
+implementations and fixes the security/correctness findings from the code review.
+
+### Blockchain & IPFS are now real (was a local-file simulation)
+
+- **On-chain registry.** `share`, `view`, `revoke`, and read-accounting now perform real
+  signed transactions and `eth_call` reads against the configured RPC node (remote or local
+  anvil). New `src/eth.rs` provides JSON-RPC, ABI encode/decode for `BsecSecretRegistry`,
+  EIP-155 legacy transaction signing (secp256k1 via `k256`), and receipt polling, with a
+  hand-rolled minimal RLP encoder covered by unit tests.
+- **IPFS storage.** Payloads are stored via a real IPFS backend — Pinata (`pinFileToIPFS`,
+  JWT) when configured, otherwise a Kubo daemon (`/api/v0/add`); fetch falls back through the
+  local cache, Kubo `cat`, then gateways. The previous `QmBsecMock…` pseudo-CID is gone.
+- **No fabricated success.** With no backend reachable, commands fail with a clear error
+  naming what is unreachable — no fake transaction hashes, no mock CIDs.
+- A local `secret_index.json` only enumerates the wallet's known secret IDs and a local
+  `hidden` flag; authoritative state (reads, revocation, expiry, recipient) always comes from
+  the chain.
+
+### Security
+
+- **BIP-44 derivation is now a hard failure** instead of silently falling back to a raw seed
+  slice. The old fallback produced a non-standard key/address that would strand funds and make
+  secrets un-decryptable.
+- **Unencrypted wallets warn loudly** at creation — the private key and mnemonic are stored in
+  plaintext (mode 0600) unless `--password` is given.
+- **ECDH → AES key derivation uses HKDF-SHA256** with a domain-separation label, replacing a
+  bare `SHA-256(shared_x)`.
+- **Security model documented** in the README: confidentiality is cryptographic (AES-256-GCM +
+  ECDH), but TTL / max-reads / revocation are advisory against a recipient who already fetched
+  the payload; `--to public` provides no confidentiality.
+- **Public secrets are not read-limited.** `recordRead` previously let any caller inflate a
+  public secret's `readCount` and burn its `maxReads`, denying legitimate readers. Public
+  secrets are readable by anyone and cannot be meaningfully read-limited, so the contract no
+  longer enforces `maxReads`/authorization for them (the count is still tracked, informational);
+  the Rust view path guards the same way.
+- **Wallet plaintext zeroized on init.** The serialized wallet blob (plaintext private key +
+  mnemonic) is wrapped in `Zeroizing` so the encrypted path does not leave it in freed memory.
+- **Airtight secret rendering.** The serialized wallet blob (on init) and the
+  `wallet info --json --show-private-key/--show-mnemonic` output are now built by a manual JSON
+  writer into a single pre-sized `Zeroizing` buffer, instead of `serde_json::to_string` /
+  `serde_json::Value` + a `.clone()` of the key. That removes the un-zeroized plaintext copies
+  serde's growing buffer and intermediate `Value` left in freed heap. Text and `export` paths
+  already printed secrets by reference (no owned copy). The plaintext's only in-process
+  residence we control is now the one wiped-on-drop buffer; what's written to stdout is the
+  intended sink and out of scope.
+
+### Correctness
+
+- **Type-driven CLI exit codes.** Real `BsecError` variants are constructed at the key error
+  sites, so `handle_cli_error`'s downcast now matches instead of guessing exit codes by
+  substring-matching the message.
+- **`get_wallet_info` is read-only.** Removed the write-on-read that rewrote `wallet.json`
+  every read to bump `last_accessed` — it raced under concurrent invocations and rewrote the
+  plaintext key for unencrypted wallets.
+- **Full 256-bit secret IDs** (`0x` + 64 hex) map losslessly onto the contract `bytes32` key,
+  replacing the previous 64-bit, ASCII-packed 16-char ID.
+- **HTTP clients propagate build errors** instead of silently degrading to a no-timeout client.
+
+### Removed
+
+- **Legacy `get` / `set` key-value store** and its machine-local `~/.bsec/.master_key` (stored
+  in plaintext next to its data). This parallel secret store added confusion and attack surface;
+  the wallet, env-file, and on-chain secret flows are unaffected.
+
+### Tooling & configuration
+
+- `config --registry <addr>` sets the deployed registry address; network config gains
+  `ipfs.api_url` and `ipfs.pinning_jwt` (also read from `BSEC_PINATA_JWT`).
+- `docker-compose.yml`: anvil now binds `0.0.0.0` (the foundry image's `/bin/sh -c` entrypoint
+  had swallowed the flags, leaving it on `127.0.0.1`); healthcheck uses `cast`.
+- `scripts/e2e-setup.sh` provisions the full local stack (anvil + IPFS, contract deploy,
+  wallet creation + funding); `docs/smart_contracts.md` documents the same steps.
+- On-chain integration tests are gated behind `BSEC_E2E=1`; the default `cargo test` suite runs
+  without any network.

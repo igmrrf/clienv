@@ -6,7 +6,7 @@ This document provides step-by-step instructions for compiling and deploying the
 
 ## 📋 Overview & Contract Architecture
 
-The [`contracts/BsecSecretRegistry.sol`](file:///Users/igmrrf/Desktop/tmp/bsec/contracts/BsecSecretRegistry.sol) contract manages access rules, expiration timestamps, read counters, IPFS CIDs, and verified sender identities (`msg.sender`) on-chain.
+The [`contracts/BsecSecretRegistry.sol`](contracts/BsecSecretRegistry.sol) contract manages access rules, expiration timestamps, read counters, IPFS CIDs, and verified sender identities (`msg.sender`) on-chain.
 
 ### Key Contract Functions
 

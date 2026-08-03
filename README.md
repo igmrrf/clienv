@@ -13,7 +13,39 @@ A powerful, high-performance CLI tool written in Rust for secure, decentralized 
 - 📝 **Schema Validation & Templates**: Validate `.env` files against `.env.schema`, auto-fix missing keys, and generate `.env.template` files (`generate`).
 - 🔐 **End-to-End File Encryption**: Encrypt (`encrypt`) and decrypt (`decrypt`) `.env` files using `$DOTENV_PASS`, `$DOTENV_<ENV>_PASS`, or `.env.pass` files.
 - 📋 **Environment Variable Logging**: Inspect single variable values (`log`).
-- ⚡ **Built-in Fast Storage**: Simple encrypted key-value store (`set`, `get`) and pattern search (`search`).
+- 🔎 **Pattern Search**: Substring search within files (`search`).
+
+---
+
+## Security Model & Limitations
+
+Read this before relying on `bsec` for sensitive data.
+
+- **Confidentiality is cryptographic; access controls are advisory.** Secret payloads are
+  encrypted with AES-256-GCM under a per-secret random key, which is wrapped for the
+  recipient via ECDH (secp256k1) + HKDF-SHA256. Only the holder of the recipient private key
+  can decrypt. The on-chain `expiresAt`, `maxReads`, and `revoked` fields gate *listing and
+  the recorded read count* — they do **not** cryptographically prevent a recipient who has
+  already fetched the IPFS payload from decrypting it again offline. Treat TTL / max-reads /
+  revocation as best-effort lifecycle signals, not hard guarantees against a past recipient.
+- **`--to public` provides no confidentiality.** Public secrets are wrapped with a fixed,
+  well-known key so anyone can read them. Use it only for non-sensitive content.
+- **Real backends required.** `share`/`view` perform real on-chain transactions (a funded
+  wallet + deployed `BsecSecretRegistry`) and real IPFS storage (a Pinata JWT or a reachable
+  IPFS daemon). With no backend reachable, commands fail with a clear error — they never fake
+  success. See `scripts/e2e-setup.sh` for a local anvil + IPFS stack.
+- **Wallet at rest.** Always create wallets with `--password` (Argon2id + AES-256-GCM).
+  Without a password the private key and mnemonic are stored unencrypted (mode 0600) and
+  `init` prints a warning.
+- **`--no-export` is an in-tool control, not a cryptographic guarantee.** Sealing a secret
+  makes `bsec` refuse to write it to a file (`materialize`, `materialize --as schema`, and
+  `view --output` are all blocked); terminal `view` and `run --secret` staging still work.
+  But a recipient holds the plaintext after decrypt and can persist it by any other means.
+  Treat the seal as a guard rail against accidental file writes, not as DRM.
+- **Materialized files are plaintext on disk.** `materialize` and `run --secret` write real
+  secret files at mode `0600` under `0700` directories. `run --secret` stages into a temp
+  dir wiped on exit (including SIGINT/SIGTERM, best-effort); `materialize` files persist —
+  delete them when done. `materialize --as schema` discloses key *names* (values withheld).
 
 ---
 
@@ -31,16 +63,16 @@ cargo build --release
 
 ## 🚀 Deployment & Distribution Guides
 
-For platform-specific installation and deployment flows, see the [Documentation Index](file:///Users/igmrrf/Desktop/tmp/bsec/docs/README.md):
+For platform-specific installation and deployment flows, see the [Documentation Index](docs/README.md):
 
-* 📦 **Cargo (crates.io)**: [`docs/cargo.md`](file:///Users/igmrrf/Desktop/tmp/bsec/docs/cargo.md)
-* 🍺 **Homebrew**: [`docs/homebrew.md`](file:///Users/igmrrf/Desktop/tmp/bsec/docs/homebrew.md)
-* 🖥️ **GitHub Binary Releases**: [`docs/binary_releases.md`](file:///Users/igmrrf/Desktop/tmp/bsec/docs/binary_releases.md)
-* 🐳 **Docker & GHCR**: [`docs/docker.md`](file:///Users/igmrrf/Desktop/tmp/bsec/docs/docker.md)
-* 🐧 **Linux Packages (.deb, .rpm, AUR, snap)**: [`docs/linux_packages.md`](file:///Users/igmrrf/Desktop/tmp/bsec/docs/linux_packages.md)
-* 🪟 **Windows Packages (winget, choco, scoop)**: [`docs/windows_packages.md`](file:///Users/igmrrf/Desktop/tmp/bsec/docs/windows_packages.md)
-* 🟢 **NPM / NPX Engine**: [`docs/npm.md`](file:///Users/igmrrf/Desktop/tmp/bsec/docs/npm.md)
-* ⛓️ **Smart Contracts & EVM**: [`docs/smart_contracts.md`](file:///Users/igmrrf/Desktop/tmp/bsec/docs/smart_contracts.md)
+* 📦 **Cargo (crates.io)**: [`docs/cargo.md`](docs/cargo.md)
+* 🍺 **Homebrew**: [`docs/homebrew.md`](docs/homebrew.md)
+* 🖥️ **GitHub Binary Releases**: [`docs/binary_releases.md`](docs/binary_releases.md)
+* 🐳 **Docker & GHCR**: [`docs/docker.md`](docs/docker.md)
+* 🐧 **Linux Packages (.deb, .rpm, AUR, snap)**: [`docs/linux_packages.md`](docs/linux_packages.md)
+* 🪟 **Windows Packages (winget, choco, scoop)**: [`docs/windows_packages.md`](docs/windows_packages.md)
+* 🟢 **NPM / NPX Engine**: [`docs/npm.md`](docs/npm.md)
+* ⛓️ **Smart Contracts & EVM**: [`docs/smart_contracts.md`](docs/smart_contracts.md)
 
 ---
 
@@ -100,6 +132,50 @@ bsec revoke <secret_id>
 # Hide secret(s)
 bsec hide <secret_id>
 ```
+
+### 3b. Materializing Secrets to Files
+
+Some apps need a real file at a path (TLS `key.pem`, a Google `service-account.json`, a
+`kubeconfig`) rather than env vars. Tag a shared secret with its file kind, then materialize
+it — or stage it for a command with `run --secret`.
+
+```bash
+# Share a file as a tagged, materializable secret (kind inferred from extension, or --as)
+bsec share --file ./cert.pem --to 0x04<recipient-pubkey>
+bsec share --file ./creds.json --as json --filename service-account.json --to 0x04...
+
+# Seal it: bsec will refuse every file write (terminal view only)
+bsec share --file ./cert.pem --no-export --to 0x04...
+
+# Pack several files into one secret via a bundle manifest
+cat > bundle.json <<'JSON'
+{ "members": [
+  { "path": "./cert.pem",  "as": "pem",  "filename": "cert.pem" },
+  { "path": "./creds.json", "as": "json", "filename": "creds.json",
+    "env": "GOOGLE_APPLICATION_CREDENTIALS" },
+  { "path": "./.env.prod",  "as": "env",  "filename": ".env" }
+] }
+JSON
+bsec share --bundle bundle.json --to 0x04...
+
+# Materialize a single secret to a file or directory (mode 0600). One call = one read.
+bsec materialize <secret_id> --file ./out/cert.pem
+bsec materialize <secret_id> --dir ./out            # uses the sender's suggested filename
+
+# Materialize a bundle: every member is written under --dir
+bsec materialize <secret_id> --dir ./secrets
+
+# Extract just the KEY names (no values) as a .env.schema
+bsec materialize <secret_id> --as schema --file .env.schema
+
+# Stage files into a wiped-on-exit temp dir and run a command. For each member, bsec injects
+# <STEM>_FILE=<abspath> (plus any manifest "env" alias); env members also inject KEY=VAL.
+bsec run --secret <secret_id> -- sh -c 'echo "$GOOGLE_APPLICATION_CREDENTIALS"; cat "$CERT_FILE"'
+```
+
+Notes: sender-supplied filenames are sanitized to plain basenames (no `..`, no separators).
+Binary bodies (keystores, DER) are stored base64 and restored to raw bytes on write.
+`--force` is required to overwrite an existing file.
 
 ### 4. Network Configuration
 

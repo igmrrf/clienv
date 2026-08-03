@@ -6,7 +6,6 @@ use base64::prelude::*;
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use zeroize::Zeroizing;
 
 use crate::blockchain::{
@@ -36,6 +35,51 @@ pub struct IpfsPayload {
     pub content: String,
     pub content_key: String,
     pub ephemeral_pubkey: Option<String>,
+
+    // --- file-materialization metadata, all optional for backward compat ---
+    /// Intended file type of `content` (single-file secrets).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<SecretKind>,
+    /// Suggested output basename (single-file secrets).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    /// Seal: when true, refuse all file materialization (terminal view only).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_export: bool,
+    /// Present => this secret is a bundle; materialization iterates members.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members: Option<Vec<BundleMember>>,
+    /// Encoding of the single-file `content`: "utf8" (default) or "base64".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_encoding: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SecretKind {
+    Env,
+    Pem,
+    Json,
+    Cred,
+}
+
+fn enc_utf8() -> String {
+    "utf8".to_string()
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BundleMember {
+    pub kind: SecretKind,
+    /// Basename only, e.g. "creds.json".
+    pub filename: String,
+    /// The member's plaintext body (whole payload is still AEAD-encrypted at rest).
+    pub content: String,
+    /// "utf8" (default) or "base64" for binary member bodies.
+    #[serde(default = "enc_utf8")]
+    pub encoding: String,
+    /// Optional explicit env var name to bind this member's staged path to under `run`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
 }
 
 pub fn parse_duration(ttl_str: &str) -> Result<u64> {
@@ -57,6 +101,16 @@ pub fn parse_duration(ttl_str: &str) -> Result<u64> {
         "w" | "week" | "weeks" => Ok(val * 86400 * 7),
         _ => Err(anyhow!("Invalid TTL unit (use s, m, h, d, w)")),
     }
+}
+
+/// Derive an AES-256 wrapper key from a raw ECDH shared secret using HKDF-SHA256 with a
+/// fixed domain-separation label, instead of a bare SHA-256 of the shared X coordinate.
+fn derive_ecdh_key(shared_secret: &[u8]) -> Result<[u8; 32]> {
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, shared_secret);
+    let mut okm = [0u8; 32];
+    hk.expand(b"bsec-ecdh-aes256gcm-v1", &mut okm)
+        .map_err(|_| anyhow!("HKDF key derivation failed"))?;
+    Ok(okm)
 }
 
 fn encrypt_text(plain: &str, key_bytes: &[u8; 32]) -> Result<String> {
@@ -91,6 +145,35 @@ fn decrypt_text(cipher_str: &str, key_bytes: &[u8; 32]) -> Result<String> {
     String::from_utf8(plain_bytes).map_err(|e| anyhow!("utf8 error: {}", e))
 }
 
+/// Encrypt each bundle member's plaintext body in place with the content key. The IPFS
+/// payload JSON is stored cleartext except for these AES-256-GCM ciphertext fields, so
+/// member bodies MUST be sealed before upload or they would leak on IPFS.
+fn seal_member_bodies(members: &mut [BundleMember], key: &[u8; 32]) -> Result<()> {
+    for m in members.iter_mut() {
+        m.content = encrypt_text(&m.content, key)?;
+    }
+    Ok(())
+}
+
+/// Decrypt each bundle member's body in place (inverse of `seal_member_bodies`).
+fn open_member_bodies(members: &mut [BundleMember], key: &[u8; 32]) -> Result<()> {
+    for m in members.iter_mut() {
+        m.content = decrypt_text(&m.content, key)?;
+    }
+    Ok(())
+}
+
+/// Metadata describing how a shared secret should be materialized to file(s).
+#[derive(Default)]
+pub struct ShareMeta {
+    pub kind: Option<SecretKind>,
+    pub filename: Option<String>,
+    pub no_export: bool,
+    pub content_encoding: Option<String>,
+    /// Plaintext bundle members; their bodies are sealed before upload.
+    pub members: Option<Vec<BundleMember>>,
+}
+
 fn resolve_recipient_pubkey(to_address: &str, sender_info: &crate::wallet::WalletInfo) -> Result<Option<PublicKey>> {
     if to_address.to_lowercase() == sender_info.address.to_lowercase() || to_address == sender_info.public_key {
         let pub_bytes = hex_to_bytes(&sender_info.public_key)?;
@@ -110,9 +193,12 @@ fn resolve_recipient_pubkey(to_address: &str, sender_info: &crate::wallet::Walle
             .map_err(|e| anyhow!("Invalid recipient public key: {}", e));
     }
 
-    Err(anyhow!(
-        "Recipient must be a valid SEC1 public key (0x04...), your own wallet address, or 'public'. EVM addresses (0x...) of external users cannot be used for ECDH key exchange without their public key."
-    ))
+    Err(crate::errors::BsecError::InvalidRecipient(
+        "Recipient must be a valid SEC1 public key (0x04...), your own wallet address, or 'public'. \
+         EVM addresses (0x...) of external users cannot be used for ECDH key exchange without their public key."
+            .into(),
+    )
+    .into())
 }
 
 pub fn share_secret(
@@ -122,8 +208,14 @@ pub fn share_secret(
     to_address: &str,
     sender_address: &str,
     password: Option<&str>,
+    meta: ShareMeta,
 ) -> Result<SecretRecord> {
-    if content.len() > 10 * 1024 * 1024 {
+    let members_size: usize = meta
+        .members
+        .as_ref()
+        .map(|ms| ms.iter().map(|m| m.content.len()).sum())
+        .unwrap_or(0);
+    if content.len() + members_size > 10 * 1024 * 1024 {
         return Err(anyhow!("Secret content size exceeds maximum limit of 10MB."));
     }
 
@@ -145,7 +237,7 @@ pub fn share_secret(
             ephemeral_secret.to_nonzero_scalar(),
             recipient_pubkey.as_affine(),
         );
-        hash_digest(shared_secret.raw_secret_bytes())
+        derive_ecdh_key(shared_secret.raw_secret_bytes())?
     } else {
         return Err(anyhow!("Cannot resolve recipient public key for encryption."));
     };
@@ -156,30 +248,63 @@ pub fn share_secret(
     let encrypted_content = encrypt_text(content, &random_content_key)?;
     let encrypted_content_key = encrypt_text(&BASE64_STANDARD.encode(random_content_key.as_ref()), &wrapper_key)?;
 
+    // Seal bundle member bodies with the same content key before upload (they would
+    // otherwise sit in cleartext inside the IPFS payload JSON).
+    let sealed_members = match meta.members {
+        Some(mut ms) => {
+            seal_member_bodies(&mut ms, &random_content_key)?;
+            Some(ms)
+        }
+        None => None,
+    };
+
     let payload = IpfsPayload {
         content: encrypted_content.clone(),
         content_key: encrypted_content_key.clone(),
         ephemeral_pubkey: Some(ephemeral_pub_hex.clone()),
+        kind: meta.kind,
+        filename: meta.filename,
+        no_export: meta.no_export,
+        members: sealed_members,
+        content_encoding: meta.content_encoding,
     };
     let payload_json = serde_json::to_string(&payload)?;
 
     let ipfs_cid = upload_to_ipfs(&payload_json)?;
 
+    // Full 256-bit id (0x + 64 hex) so encode_bytes32_hex maps it losslessly onto the
+    // contract's bytes32 key. The previous 16-hex-char id was only 64 bits and, being
+    // non-hex-prefixed, was packed as ASCII bytes — inviting collisions on the on-chain key.
     let random_nonce: u64 = rand::random();
     let id_seed = format!("{}:{}:{}:{}", sender_address, to_address, now, random_nonce);
-    let id_hash = bytes_to_hex(&hash_digest(id_seed.as_bytes()));
-    let secret_id = id_hash[0..16].to_string();
+    let secret_id = format!("0x{}", bytes_to_hex(&hash_digest(id_seed.as_bytes())));
 
     let is_public = to_address == "public";
 
+    // On-chain recipient is an EVM address: zero for public, else derived from the
+    // recipient's public key (real ECDH confidentiality is enforced separately).
+    let recipient_addr: [u8; 20] = if is_public {
+        [0u8; 20]
+    } else if let Some(ref pk) = recipient_pubkey_opt {
+        let ep = pk.to_encoded_point(false);
+        let hash = crate::blockchain::keccak256(&ep.as_bytes()[1..]);
+        let mut addr = [0u8; 20];
+        addr.copy_from_slice(&hash[12..32]);
+        addr
+    } else {
+        [0u8; 20]
+    };
+
+    let priv_bytes = Zeroizing::new(hex_to_bytes(&sender_info.private_key)?);
+
     register_secret_on_chain(
+        &priv_bytes,
         &secret_id,
-        to_address,
+        &recipient_addr,
         &ipfs_cid,
         expires_at,
         max_reads,
         is_public,
-        sender_address,
     )?;
 
     let record = SecretRecord {
@@ -200,6 +325,14 @@ pub fn share_secret(
 }
 
 pub fn view_secret(secret_id: &str, user_address: &str, password: Option<&str>) -> Result<String> {
+    Ok(view_payload(secret_id, user_address, password)?.content)
+}
+
+/// Decrypt a secret and return the WHOLE payload (metadata + plaintext content + plaintext
+/// member bodies). Performs authorization, expiry/read-limit checks, and consumes exactly
+/// one on-chain read — a bundle counts as one read, not N. Materialize needs this instead
+/// of the flattened `view_secret` string because it must see kind/filename/members/no_export.
+pub fn view_payload(secret_id: &str, user_address: &str, password: Option<&str>) -> Result<IpfsPayload> {
     let onchain_info = get_secret_info_on_chain(secret_id)?;
 
     let wallet_info = crate::wallet::get_wallet_info(password)?;
@@ -214,7 +347,7 @@ pub fn view_secret(secret_id: &str, user_address: &str, password: Option<&str>) 
         || onchain_info.sender.to_lowercase() == user_address.to_lowercase();
 
     if !is_recipient && !is_sender {
-        return Err(anyhow!("You do not have permission to view this secret."));
+        return Err(crate::errors::BsecError::PermissionDenied("you may not view this secret".into()).into());
     }
 
     if onchain_info.revoked {
@@ -223,11 +356,12 @@ pub fn view_secret(secret_id: &str, user_address: &str, password: Option<&str>) 
 
     let now = crate::wallet::current_timestamp();
     if now > onchain_info.expires_at {
-        return Err(anyhow!("This secret has expired."));
+        return Err(crate::errors::BsecError::SecretExpired.into());
     }
 
-    if onchain_info.read_count >= onchain_info.max_reads {
-        return Err(anyhow!("Maximum read count exceeded for this secret."));
+    // Public secrets are not read-limited (the contract does not enforce maxReads for them).
+    if !onchain_info.is_public && onchain_info.read_count >= onchain_info.max_reads {
+        return Err(crate::errors::BsecError::SecretExpired.into());
     }
 
     let payload_str = fetch_from_ipfs(&onchain_info.ipfs_cid)?;
@@ -248,7 +382,7 @@ pub fn view_secret(secret_id: &str, user_address: &str, password: Option<&str>) 
             secret_key.to_nonzero_scalar(),
             eph_public.as_affine(),
         );
-        hash_digest(shared_secret.raw_secret_bytes())
+        derive_ecdh_key(shared_secret.raw_secret_bytes())?
     } else {
         return Err(anyhow!("Corrupted secret payload: missing ephemeral public key"));
     };
@@ -269,14 +403,43 @@ pub fn view_secret(secret_id: &str, user_address: &str, password: Option<&str>) 
     }
     key_bytes.copy_from_slice(&key_bytes_vec);
 
-    let decrypted = decrypt_text(&payload.content, &key_bytes)?;
+    let decrypted_content = if payload.content.is_empty() {
+        String::new()
+    } else {
+        decrypt_text(&payload.content, &key_bytes)?
+    };
 
-    record_read_on_chain(secret_id)?;
+    // Unseal bundle member bodies with the same content key.
+    let decrypted_members = match payload.members {
+        Some(mut ms) => {
+            open_member_bodies(&mut ms, &key_bytes)?;
+            Some(ms)
+        }
+        None => None,
+    };
 
-    Ok(decrypted)
+    let priv_bytes = Zeroizing::new(hex_to_bytes(&wallet_info.private_key)?);
+    record_read_on_chain(&priv_bytes, secret_id)?;
+    crate::blockchain::index_note(secret_id, "recipient");
+
+    Ok(IpfsPayload {
+        content: decrypted_content,
+        // content_key is consumed above; do not surface the wrapped key to callers.
+        content_key: String::new(),
+        ephemeral_pubkey: payload.ephemeral_pubkey,
+        kind: payload.kind,
+        filename: payload.filename,
+        no_export: payload.no_export,
+        members: decrypted_members,
+        content_encoding: payload.content_encoding,
+    })
 }
 
-pub fn load_secret_as_env(secret_id: &str, user_address: &str, password: Option<&str>) -> Result<BTreeMap<String, String>> {
+/// Decrypt a secret and flatten it into a KEY=VALUE map (env or JSON object). Retained helper
+/// for env-style consumers; `run --secret` uses `view_payload` directly so it can also stage
+/// file-kind and bundle secrets (calling this would double-count the on-chain read).
+#[allow(dead_code)]
+pub fn load_secret_as_env(secret_id: &str, user_address: &str, password: Option<&str>) -> Result<std::collections::BTreeMap<String, String>> {
     let decrypted_content = view_secret(secret_id, user_address, password)?;
     if decrypted_content.trim().starts_with('{') {
         crate::env_file::parse_json_content(&decrypted_content)
@@ -314,30 +477,136 @@ pub fn list_secrets(
     Ok(results)
 }
 
-pub fn revoke_secret(secret_id: &str, user_address: &str) -> Result<()> {
-    revoke_secret_on_chain(secret_id, user_address)
+pub fn revoke_secret(secret_id: &str, password: Option<&str>) -> Result<()> {
+    let wallet_info = crate::wallet::get_wallet_info(password)?;
+    let priv_bytes = Zeroizing::new(hex_to_bytes(&wallet_info.private_key)?);
+    revoke_secret_on_chain(&priv_bytes, secret_id)
 }
 
-pub fn hide_secret(secret_id: Option<&str>, user_filter: Option<&str>, user_address: &str) -> Result<usize> {
+pub fn hide_secret(
+    secret_id: Option<&str>,
+    user_filter: Option<&str>,
+    user_address: &str,
+    password: Option<&str>,
+) -> Result<usize> {
+    let wallet_info = crate::wallet::get_wallet_info(password)?;
+    let priv_bytes = Zeroizing::new(hex_to_bytes(&wallet_info.private_key)?);
+
     let onchain_list = list_secrets_on_chain(user_address, user_filter, true, false, false)?;
     let mut hidden_count = 0;
 
     for (id, rec) in onchain_list {
-        let matches_id = secret_id.map_or(true, |target| id == target);
-        let matches_filter = user_filter.map_or(true, |target| {
+        let matches_id = secret_id.is_none_or(|target| id == target);
+        let matches_filter = user_filter.is_none_or(|target| {
             rec.recipient.to_lowercase() == target.to_lowercase()
                 || rec.sender.to_lowercase() == target.to_lowercase()
         });
 
         if matches_id && matches_filter {
-            // FAILSAFE DESIGN: Hiding a secret sets local visibility state (`hidden = true`).
-            // It also attempts best-effort on-chain revocation if the user is the creator.
-            // Any error during on-chain revocation is logged safely so local hiding succeeds.
-            if let Ok(()) = hide_secret_on_chain(&id, user_address) {
+            // Hiding sets local visibility (`hidden = true`) and best-effort revokes on-chain
+            // if this wallet is the creator; revocation failure is logged, local hide still applies.
+            if hide_secret_on_chain(&priv_bytes, &id).is_ok() {
                 hidden_count += 1;
             }
         }
     }
 
     Ok(hidden_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Backward compat: a payload serialized before this feature has only the three
+    // original fields. It MUST still deserialize, with new fields defaulting.
+    #[test]
+    fn old_payload_json_deserializes_with_defaults() {
+        let old_json = r#"{
+            "content": "nonce:cipher",
+            "content_key": "nonce:wrapped",
+            "ephemeral_pubkey": "0x04abcd"
+        }"#;
+        let p: IpfsPayload = serde_json::from_str(old_json).unwrap();
+        assert_eq!(p.content, "nonce:cipher");
+        assert_eq!(p.kind, None);
+        assert_eq!(p.filename, None);
+        assert!(!p.no_export);
+        assert!(p.members.is_none());
+        assert_eq!(p.content_encoding, None);
+    }
+
+    // A single-file secret with no new metadata omits every new field from the wire form,
+    // keeping bytes identical to a pre-feature payload.
+    #[test]
+    fn plain_payload_omits_all_new_fields() {
+        let p = IpfsPayload {
+            content: "c".to_string(),
+            content_key: "k".to_string(),
+            ephemeral_pubkey: Some("0x04".to_string()),
+            kind: None,
+            filename: None,
+            no_export: false,
+            members: None,
+            content_encoding: None,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains("kind"));
+        assert!(!json.contains("filename"));
+        assert!(!json.contains("no_export"));
+        assert!(!json.contains("members"));
+        assert!(!json.contains("content_encoding"));
+    }
+
+    // A bundle payload survives serialize -> deserialize intact.
+    #[test]
+    fn bundle_payload_roundtrips() {
+        let p = IpfsPayload {
+            content: String::new(),
+            content_key: "k".to_string(),
+            ephemeral_pubkey: None,
+            kind: None,
+            filename: None,
+            no_export: true,
+            members: Some(vec![BundleMember {
+                kind: SecretKind::Pem,
+                filename: "cert.pem".to_string(),
+                content: "LS0t".to_string(),
+                encoding: "base64".to_string(),
+                env: Some("TLS_CERT".to_string()),
+            }]),
+            content_encoding: None,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: IpfsPayload = serde_json::from_str(&json).unwrap();
+        assert!(back.no_export);
+        let m = back.members.unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].kind, SecretKind::Pem);
+        assert_eq!(m[0].filename, "cert.pem");
+        assert_eq!(m[0].encoding, "base64");
+        assert_eq!(m[0].env.as_deref(), Some("TLS_CERT"));
+    }
+
+    #[test]
+    fn member_bodies_seal_open_roundtrip() {
+        let key = [7u8; 32];
+        let mut members = vec![
+            BundleMember { kind: SecretKind::Pem, filename: "cert.pem".into(), content: "PEM BODY".into(), encoding: "utf8".into(), env: None },
+            BundleMember { kind: SecretKind::Env, filename: ".env".into(), content: "K=V".into(), encoding: "utf8".into(), env: None },
+        ];
+        seal_member_bodies(&mut members, &key).unwrap();
+        // sealed bodies are ciphertext, not the original plaintext
+        assert_ne!(members[0].content, "PEM BODY");
+        assert!(members[0].content.contains(':'));
+        open_member_bodies(&mut members, &key).unwrap();
+        assert_eq!(members[0].content, "PEM BODY");
+        assert_eq!(members[1].content, "K=V");
+    }
+
+    #[test]
+    fn secret_kind_serializes_lowercase() {
+        assert_eq!(serde_json::to_string(&SecretKind::Json).unwrap(), "\"json\"");
+        assert_eq!(serde_json::to_string(&SecretKind::Cred).unwrap(), "\"cred\"");
+    }
 }

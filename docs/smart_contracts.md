@@ -6,7 +6,7 @@ This document provides step-by-step instructions for compiling and deploying the
 
 ## 📋 Overview & Contract Architecture
 
-The [`contracts/BsecSecretRegistry.sol`](file:///Users/igmrrf/Desktop/tmp/bsec/contracts/BsecSecretRegistry.sol) contract manages access rules, expiration timestamps, read counters, IPFS CIDs, and verified sender identities (`msg.sender`) on-chain.
+The [`contracts/BsecSecretRegistry.sol`](../contracts/BsecSecretRegistry.sol) contract manages access rules, expiration timestamps, read counters, IPFS CIDs, and verified sender identities (`msg.sender`) on-chain.
 
 ### Key Contract Functions
 
@@ -54,21 +54,75 @@ docker compose ps
 
 ### Step 2: Deploy Contract via Forge
 
-Anvil pre-funds 10 test accounts with 10,000 ETH each. Use Account 0 private key for local deployment:
+Anvil pre-funds 10 test accounts with 10,000 ETH each. Use Account 0 private key for local deployment. `--broadcast` is required on recent Foundry to actually send the deploy transaction:
 
 ```bash
 forge create contracts/BsecSecretRegistry.sol:BsecSecretRegistry \
   --rpc-url http://localhost:8545 \
+  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+  --broadcast
+```
+
+Note the `Deployed to: 0x...` address from the output — you need it in Step 3.
+
+If you don't have Foundry installed on the host, run it from the Foundry image instead:
+
+```bash
+docker run --rm -v "$PWD/contracts:/contracts" \
+  --add-host host.docker.internal:host-gateway ghcr.io/foundry-rs/foundry:latest \
+  forge create /contracts/BsecSecretRegistry.sol:BsecSecretRegistry \
+  --rpc-url http://host.docker.internal:8545 \
+  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+  --broadcast
+```
+
+### Step 3: Register the Deployed Address in `bsec`
+
+Point `bsec` at the local node **and** the deployed registry address (from Step 2):
+
+```bash
+bsec config --network local \
+  --rpc "http://localhost:8545" \
+  --registry "0xYourDeployedRegistryAddress"
+```
+
+The local IPFS daemon at `http://127.0.0.1:5001` is used automatically (`ipfs.api_url`).
+
+### Step 4: Create and Fund the `bsec` Wallet
+
+`bsec` generates its own wallet, which is **separate** from Anvil's pre-funded accounts and
+starts with a zero balance. On-chain writes (`share`, `view`, `revoke`) send real transactions,
+so the wallet must hold native gas token. Create it, then fund it from Anvil Account 0:
+
+```bash
+# Create the wallet (add --password to encrypt at rest)
+bsec init --overwrite
+
+# Read the wallet address
+WALLET=$(bsec wallet info | awk '/Address:/ {print $2}')
+
+# Fund it with 10 ETH from Anvil Account 0
+cast send "$WALLET" --value 10ether \
+  --rpc-url http://localhost:8545 \
   --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 ```
 
-### Step 3: Register Deployed Address in `bsec`
-
-Save the deployed contract address in your network configuration:
+### Step 5: Verify End-to-End
 
 ```bash
-bsec config --network local --rpc "http://localhost:8545"
+# Share a public secret -> prints a Secret ID
+bsec share --content "hello local chain" --to public --ttl 1h --max-reads 3
+
+# View it back by ID (real eth_call + IPFS fetch)
+bsec view <secret_id>
+
+# List and revoke
+bsec list
+bsec revoke <secret_id>
 ```
+
+> Shortcut: `./scripts/e2e-setup.sh` automates Steps 1–4 (bring up stack, deploy, configure,
+> create + fund wallet), after which `BSEC_E2E=1 cargo test` runs the gated integration flows.
 
 ---
 
@@ -91,6 +145,14 @@ Export your testnet wallet private key and RPC URL:
 ```bash
 export PRIVATE_KEY="0x_your_private_key_here"
 ```
+
+> On recent Foundry, add `--broadcast` to each `forge create` below to send the deploy
+> transaction. After deploying, register the address and fund your `bsec` wallet:
+>
+> ```bash
+> bsec config --network <net> --registry 0xYourDeployedRegistryAddress
+> # then fund the `bsec wallet info` address from a faucet before share/view/revoke
+> ```
 
 #### A. Polygon Amoy Testnet (Chain ID 80002)
 
