@@ -100,11 +100,16 @@ pub fn write_secure_file(path: &Path, content: &[u8]) -> Result<()> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         use std::io::Write;
+        // O_NOFOLLOW: refuse to open the final path component if it is a symlink. Without this
+        // an attacker who can plant a symlink at the target between an existence check and the
+        // write (TOCTOU, CWE-59/CWE-367) could redirect a plaintext-secret write elsewhere, or
+        // clobber a victim-owned file. Opening a symlink now fails with ELOOP instead.
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)?;
         file.write_all(content)?;
     }
@@ -283,7 +288,18 @@ pub fn init_wallet(
     password: Option<String>,
     user_id: Option<String>,
     overwrite: bool,
+    allow_plaintext: bool,
 ) -> Result<WalletInfo> {
+    // Encryption is the default. Storing the private key and mnemonic in cleartext (CWE-312)
+    // is only permitted when the caller explicitly opts in via `allow_plaintext`; otherwise a
+    // missing password is a hard error rather than a silent plaintext write.
+    if password.is_none() && !allow_plaintext {
+        return Err(anyhow!(
+            "A wallet password is required to encrypt the private key and mnemonic at rest. \
+             Provide one interactively or via --password, or pass --no-encryption to explicitly \
+             store the wallet UNENCRYPTED (not recommended)."
+        ));
+    }
     let app_dir = get_app_dir();
     let config_path = app_dir.join("config.json");
     let wallet_path = app_dir.join("wallet.json");

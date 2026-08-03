@@ -42,7 +42,7 @@ fn bsec(home: &Path) -> Result<Command, Box<dyn std::error::Error>> {
 
 fn init_wallet(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd = bsec(home)?;
-    cmd.arg("init").arg("--overwrite");
+    cmd.arg("init").arg("--overwrite").arg("--no-encryption");
     cmd.assert().success();
     Ok(())
 }

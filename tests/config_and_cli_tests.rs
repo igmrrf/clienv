@@ -147,6 +147,7 @@ fn test_json_output_flags() -> Result<(), Box<dyn std::error::Error>> {
         .current_dir(temp_dir.path())
         .arg("init")
         .arg("--overwrite")
+        .arg("--no-encryption")
         .assert()
         .success();
 

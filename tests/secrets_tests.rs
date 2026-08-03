@@ -46,7 +46,7 @@ fn test_public_secret_sharing_flow() -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd_init = Command::cargo_bin("bsec")?;
     cmd_init.current_dir(temp_dir.path());
     cmd_init.env("BSEC_HOME", temp_dir.path());
-    cmd_init.arg("init").arg("--overwrite");
+    cmd_init.arg("init").arg("--overwrite").arg("--no-encryption");
     cmd_init.assert().success();
 
     // 2. User A shares a public secret
@@ -100,7 +100,7 @@ fn test_ecdh_pubkey_secret_sharing_flow() -> Result<(), Box<dyn std::error::Erro
     let mut cmd_init = Command::cargo_bin("bsec")?;
     cmd_init.current_dir(temp_dir.path());
     cmd_init.env("BSEC_HOME", temp_dir.path());
-    cmd_init.arg("init").arg("--overwrite");
+    cmd_init.arg("init").arg("--overwrite").arg("--no-encryption");
     let assert_init = cmd_init.assert().success();
     let stdout_init = String::from_utf8(assert_init.get_output().stdout.clone())?;
 
@@ -235,7 +235,7 @@ fn test_external_address_rejection_for_ecdh() -> Result<(), Box<dyn std::error::
     let mut cmd_init = Command::cargo_bin("bsec")?;
     cmd_init.current_dir(temp_dir.path());
     cmd_init.env("BSEC_HOME", temp_dir.path());
-    cmd_init.arg("init").arg("--overwrite");
+    cmd_init.arg("init").arg("--overwrite").arg("--no-encryption");
     cmd_init.assert().success();
 
     let external_addr = "0x1111222233334444555566667777888899990000";
@@ -268,7 +268,7 @@ fn test_wallet_and_secret_sharing_lifecycle_flow() -> Result<(), Box<dyn std::er
     let mut cmd_init = Command::cargo_bin("bsec")?;
     cmd_init.current_dir(temp_dir.path());
     cmd_init.env("BSEC_HOME", temp_dir.path());
-    cmd_init.arg("init").arg("--overwrite");
+    cmd_init.arg("init").arg("--overwrite").arg("--no-encryption");
     cmd_init.assert().success();
 
     // 2. Share secret

@@ -41,8 +41,27 @@ fn resolve_pinning_jwt(conf: &NetworkConfig) -> Option<String> {
         .or_else(|| std::env::var("BSEC_PINATA_JWT").ok().filter(|s| !s.trim().is_empty()))
 }
 
+/// Accept only well-formed CID strings: length in 2..=64 and every byte
+/// ASCII-alphanumeric (base58btc / base32 charset). Rejects '/', '.', '\0',
+/// whitespace, and any other separator that could enable path traversal.
+fn valid_cid(cid: &str) -> bool {
+    let len = cid.len();
+    (2..=64).contains(&len) && cid.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Derive the on-disk cache filename from a SHA-256 hash of the CID so the
+/// path is ALWAYS contained within the cache dir, even if `valid_cid` is ever
+/// bypassed. Both write (upload) and read (fetch) MUST use this same
+/// derivation so the same CID maps to the same file.
+fn cache_file_for(cid: &str) -> PathBuf {
+    get_ipfs_cache_dir().join(format!(
+        "{}.json",
+        crate::wallet::bytes_to_hex(&crate::wallet::hash_digest(cid.as_bytes()))
+    ))
+}
+
 fn cache_payload(cid: &str, payload_json: &str) {
-    let cache_file = get_ipfs_cache_dir().join(format!("{}.json", cid));
+    let cache_file = cache_file_for(cid);
     let _ = crate::wallet::write_secure_file(&cache_file, payload_json.as_bytes());
 }
 
@@ -97,6 +116,9 @@ pub fn upload_to_ipfs(payload_json: &str) -> Result<String> {
     if let Some(jwt) = resolve_pinning_jwt(&conf) {
         match pin_via_pinata(&client, &jwt, payload_json) {
             Ok(cid) => {
+                if !valid_cid(&cid) {
+                    return Err(anyhow!("invalid IPFS CID {:?}", cid));
+                }
                 cache_payload(&cid, payload_json);
                 return Ok(cid);
             }
@@ -107,6 +129,9 @@ pub fn upload_to_ipfs(payload_json: &str) -> Result<String> {
     // 2. Local / self-hosted Kubo daemon.
     match add_via_kubo(&client, &conf.ipfs.api_url, payload_json) {
         Ok(cid) => {
+            if !valid_cid(&cid) {
+                return Err(anyhow!("invalid IPFS CID {:?}", cid));
+            }
             cache_payload(&cid, payload_json);
             Ok(cid)
         }
@@ -129,11 +154,17 @@ fn cat_via_kubo(client: &Client, api_url: &str, cid: &str) -> Option<String> {
 
 /// Fetch a payload by CID: local cache, then Kubo daemon, then gateways.
 pub fn fetch_from_ipfs(cid: &str) -> Result<String> {
-    let conf = crate::network_config::load_network_config();
-    let cache_dir = get_ipfs_cache_dir();
+    // Reject attacker-controlled, malformed CIDs before any filesystem or
+    // network use.
+    if !valid_cid(cid) {
+        return Err(anyhow!("invalid IPFS CID {:?}", cid));
+    }
 
-    // 1. Local cache.
-    let cache_file = cache_dir.join(format!("{}.json", cid));
+    let conf = crate::network_config::load_network_config();
+
+    // 1. Local cache. Path is hash-derived so it is always contained in the
+    //    cache dir regardless of the CID contents.
+    let cache_file = cache_file_for(cid);
     if let Ok(cached) = fs::read_to_string(&cache_file) {
         return Ok(cached);
     }
@@ -173,4 +204,45 @@ pub fn fetch_from_ipfs(cid: &str) -> Result<String> {
         "Failed to fetch payload for IPFS CID '{}' from daemon or gateways.",
         cid
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_cid_accepts_cidv0() {
+        // Realistic CIDv0 (base58btc, starts with "Qm").
+        assert!(valid_cid("QmXwF1ttoPek9x6Qq7bZ9k4x4mS4Lq9uH8dF6yZ2aB3cD4"));
+    }
+
+    #[test]
+    fn valid_cid_accepts_cidv1_base32() {
+        // Realistic CIDv1 (base32, starts with "bafy").
+        assert!(valid_cid(
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+        ));
+    }
+
+    #[test]
+    fn valid_cid_rejects_traversal_and_malformed() {
+        assert!(!valid_cid("../etc"));
+        assert!(!valid_cid("/etc/passwd"));
+        assert!(!valid_cid("a/b"));
+        assert!(!valid_cid(""));
+        assert!(!valid_cid("x\0y"));
+        // Over-long: 100 chars exceeds the 64 upper bound.
+        assert!(!valid_cid(&"a".repeat(100)));
+    }
+
+    #[test]
+    fn cache_file_for_stays_inside_cache_dir() {
+        let malicious = "/etc/passwd";
+        let path = cache_file_for(malicious);
+        assert!(
+            path.starts_with(get_ipfs_cache_dir()),
+            "hash-derived cache path {:?} escaped cache dir",
+            path
+        );
+    }
 }

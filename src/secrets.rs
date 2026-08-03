@@ -93,14 +93,29 @@ pub fn parse_duration(ttl_str: &str) -> Result<u64> {
         .parse()
         .map_err(|_| anyhow!("Invalid TTL number format"))?;
     let unit = unit_part.trim().to_lowercase();
-    match unit.as_str() {
-        "" | "s" | "sec" | "second" | "seconds" => Ok(val),
-        "m" | "min" | "minute" | "minutes" => Ok(val * 60),
-        "h" | "hr" | "hour" | "hours" => Ok(val * 3600),
-        "d" | "day" | "days" => Ok(val * 86400),
-        "w" | "week" | "weeks" => Ok(val * 86400 * 7),
-        _ => Err(anyhow!("Invalid TTL unit (use s, m, h, d, w)")),
+    let secs = match unit.as_str() {
+        "" | "s" | "sec" | "second" | "seconds" => val,
+        "m" | "min" | "minute" | "minutes" => {
+            val.checked_mul(60).ok_or_else(|| anyhow!("TTL value too large"))?
+        }
+        "h" | "hr" | "hour" | "hours" => {
+            val.checked_mul(3600).ok_or_else(|| anyhow!("TTL value too large"))?
+        }
+        "d" | "day" | "days" => {
+            val.checked_mul(86400).ok_or_else(|| anyhow!("TTL value too large"))?
+        }
+        "w" | "week" | "weeks" => val
+            .checked_mul(86400)
+            .ok_or_else(|| anyhow!("TTL value too large"))?
+            .checked_mul(7)
+            .ok_or_else(|| anyhow!("TTL value too large"))?,
+        _ => return Err(anyhow!("Invalid TTL unit (use s, m, h, d, w)")),
+    };
+    // Enforce a sane upper cap of 100 years.
+    if secs > 100 * 365 * 86400 {
+        return Err(anyhow!("TTL exceeds maximum (100 years)"));
     }
+    Ok(secs)
 }
 
 /// Derive an AES-256 wrapper key from a raw ECDH shared secret using HKDF-SHA256 with a
@@ -221,7 +236,7 @@ pub fn share_secret(
 
     let ttl_secs = parse_duration(ttl_str)?;
     let now = crate::wallet::current_timestamp();
-    let expires_at = now + ttl_secs;
+    let expires_at = now.checked_add(ttl_secs).ok_or_else(|| anyhow!("expiry timestamp overflow"))?;
 
     let sender_info = crate::wallet::get_wallet_info(password)?;
     let recipient_pubkey_opt = resolve_recipient_pubkey(to_address, &sender_info)?;
@@ -608,5 +623,32 @@ mod tests {
     fn secret_kind_serializes_lowercase() {
         assert_eq!(serde_json::to_string(&SecretKind::Json).unwrap(), "\"json\"");
         assert_eq!(serde_json::to_string(&SecretKind::Cred).unwrap(), "\"cred\"");
+    }
+
+    #[test]
+    fn parse_duration_hours() {
+        assert_eq!(parse_duration("1h").unwrap(), 3600);
+    }
+
+    #[test]
+    fn parse_duration_empty_defaults_to_one_week() {
+        assert_eq!(parse_duration("").unwrap(), 86400 * 7);
+    }
+
+    #[test]
+    fn parse_duration_multiplication_overflow_is_error() {
+        // A number that overflows u64 seconds once multiplied by the week factor.
+        assert!(parse_duration("99999999999999999999w").is_err());
+        // u64::MAX with a unit that multiplies also overflows.
+        assert!(parse_duration(&format!("{}w", u64::MAX)).is_err());
+    }
+
+    #[test]
+    fn parse_duration_beyond_100_year_cap_is_error() {
+        // 101 years in seconds is within u64 but exceeds the 100-year cap.
+        let one_hundred_one_years = 101u64 * 365 * 86400;
+        assert!(parse_duration(&format!("{}s", one_hundred_one_years)).is_err());
+        // Also via a unit-based value clearly beyond the cap.
+        assert!(parse_duration("6000w").is_err());
     }
 }

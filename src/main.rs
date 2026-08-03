@@ -34,13 +34,20 @@ enum Commands {
         /// Optional User ID or machine identifier
         user_id: Option<String>,
 
-        /// Import wallet from mnemonic phrase
+        /// Import wallet from a mnemonic phrase. Accepts a path to a file containing the phrase,
+        /// or "-" to read it from stdin. Do NOT pass the phrase inline (it would leak to the
+        /// process list and shell history).
         #[arg(long)]
         import_mnemonic: Option<String>,
 
         /// Add password protection to wallet
         #[arg(long)]
         password: Option<String>,
+
+        /// Store the wallet UNENCRYPTED (private key + mnemonic in cleartext). Not recommended;
+        /// only honored when no password is supplied.
+        #[arg(long)]
+        no_encryption: bool,
 
         /// Overwrite existing wallet if it exists
         #[arg(short, long)]
@@ -410,6 +417,33 @@ fn print_banner() {
     println!("╚═══════════════════════════════════════╝");
 }
 
+/// Resolve `--import-mnemonic` without forcing the recovery phrase onto the command line.
+/// `"-"` reads the phrase from stdin; a path to an existing file reads it from there (neither
+/// leaks to the process list / shell history, CWE-214). A literal phrase is still accepted for
+/// backward compatibility but warns about exposure.
+fn resolve_import_mnemonic(arg: Option<String>) -> Option<String> {
+    let raw = arg?;
+    if raw == "-" {
+        use std::io::Read;
+        let mut s = String::new();
+        return match std::io::stdin().read_to_string(&mut s) {
+            Ok(_) => Some(s.trim().to_string()),
+            Err(_) => None,
+        };
+    }
+    let p = std::path::Path::new(&raw);
+    if p.is_file()
+        && let Ok(contents) = std::fs::read_to_string(p)
+    {
+        return Some(contents.trim().to_string());
+    }
+    eprintln!(
+        "Warning: passing the mnemonic inline exposes it in the process list and shell history. \
+         Prefer --import-mnemonic <file> or '-' to read it from stdin."
+    );
+    Some(raw)
+}
+
 fn get_password_or_prompt(provided: Option<String>, prompt_msg: &str) -> Option<String> {
     if provided.is_some() {
         eprintln!("Warning: Passing passwords via CLI flags may expose credentials in process lists.");
@@ -451,11 +485,19 @@ fn main() {
             user_id,
             import_mnemonic,
             password,
+            no_encryption,
             overwrite,
         }) => {
             print_banner();
-            let pwd = get_password_or_prompt(password, "Set wallet encryption password (optional): ");
-            match wallet::init_wallet(import_mnemonic, pwd, user_id, overwrite) {
+            let import_mnemonic = resolve_import_mnemonic(import_mnemonic);
+            // Encryption is the default; only skip the password prompt when the caller explicitly
+            // opted out via --no-encryption (and did not also pass a password).
+            let pwd = if no_encryption && password.is_none() {
+                None
+            } else {
+                get_password_or_prompt(password, "Set wallet encryption password: ")
+            };
+            match wallet::init_wallet(import_mnemonic, pwd, user_id, overwrite, no_encryption) {
                 Ok(info) => {
                     println!("Wallet initialized successfully!");
                     println!("Address: {}", info.address);
@@ -657,6 +699,13 @@ fn main() {
 
             let pwd = get_password_or_prompt(password, "Enter wallet password (if encrypted): ");
             let recipient = to.unwrap_or_else(|| "public".to_string());
+            if recipient == "public" {
+                eprintln!(
+                    "Warning: 'public' secrets are wrapped with a well-known key and stored on \
+                     public IPFS — anyone with the secret ID can read the content. Do not use \
+                     --to public for data that must stay confidential; specify a recipient public key."
+                );
+            }
             let sender = match wallet::get_wallet_info(pwd.as_deref()) {
                 Ok(w) => w.address.clone(),
                 Err(e) => handle_cli_error("Error getting wallet info", e),
